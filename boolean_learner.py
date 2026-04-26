@@ -1,285 +1,241 @@
 """
-Boolean Function Learner
-========================
-Learns an unknown Boolean function from its truth table,
-using the same loop as a 1-layer neural network:
+Boolean Function Learner  —  partial data edition
+==================================================
+Learns a Boolean function from a *subset* of its truth table,
+exactly like a neural network trained on a limited dataset.
 
-    forward pass  →  compute loss  →  Boolean derivative  →  update weights  →  repeat
+Key difference from full-table version
+---------------------------------------
+  Before : loss computed over all 2^n rows  (cheating — perfect knowledge)
+  Now    : loss computed only over observed rows  (realistic)
 
-Representation
---------------
-The hypothesis is a Sum of Products (SOP):
-    f(x) = w_0·T_0(x)  OR  w_1·T_1(x)  OR  ...  OR  w_k·T_k(x)
+Unseen inputs are unknown. The learned SOP will generalize to them
+based purely on what it inferred from the training data — same as a NN.
 
-where each T_i is one candidate AND-term (e.g. x0∧x2, x1, x0∧x1∧x3, ...)
-and each weight w_i ∈ {0, 1} controls whether that term is included.
-
-This is exactly a 1-layer network with:
-    - Binary weights  (vs. real-valued in a NN)
-    - OR as the aggregation  (vs. weighted sum)
-    - Identity threshold at 0  (vs. sigmoid/ReLU)
-
-Training
---------
-At each step:
-    1. Forward pass   – evaluate f on all 2^n inputs.
-    2. Find errors    – rows where f(x) ≠ target(x).
-    3. Boolean deriv  – for each term T_i, compute
-                            ∂f/∂w_i = f(w_i=0, x) XOR f(w_i=1, x)
-                        at the first error point. This tells us
-                        whether toggling T_i changes the output there.
-    4. Score          – simulate flipping each w_i and count how many
-                        total errors it fixes (greedy, like gradient magnitude).
-    5. Update         – flip the best w_i  (the Boolean "gradient step").
+Pipeline (identical to a 1-layer neural network)
+-------------------------------------------------
+  1. Forward pass   — evaluate f on training rows only
+  2. Loss           — errors on training rows only
+  3. Bool deriv     — ∂f/∂w_i at the first wrong training row
+  4. Score          — which flip fixes the most training errors
+  5. Update         — flip the best weight
+  6. Repeat until training loss = 0 or no improvement possible
+  7. Evaluate       — check accuracy on held-out test rows
 """
 
-from itertools import product, combinations
+from itertools import combinations, product
+import random
 
 
-# ── helpers ──────────────────────────────────────────────────────────────────
+# ── core helpers ──────────────────────────────────────────────────────────────
 
-def all_inputs(n: int) -> list[tuple]:
-    """All 2^n binary input vectors."""
+def all_inputs(n):
     return list(product([0, 1], repeat=n))
 
-
-def generate_terms(n: int) -> list[tuple]:
-    """
-    All non-empty subsets of {0,...,n-1} as AND-terms.
-    Term (0, 2) means  x0 AND x2.
-    Ordered by size so single literals come first.
-    Total: 2^n - 1 terms.
-    """
+def generate_terms(n):
     terms = []
     for size in range(1, n + 1):
         for combo in combinations(range(n), size):
             terms.append(combo)
     return terms
 
-
-def eval_term(term: tuple, x: tuple) -> int:
-    """1 iff all variables in term are 1 in x."""
+def eval_term(term, x):
     return int(all(x[i] for i in term))
 
-
-def eval_f(weights: list[int], terms: list[tuple], x: tuple) -> int:
-    """Forward pass: OR over all active AND-terms."""
+def eval_f(weights, terms, x):
     for w, t in zip(weights, terms):
         if w and eval_term(t, x):
             return 1
     return 0
 
-
-def compute_loss(weights, terms, inputs, targets) -> int:
-    """Number of misclassified rows (our 'loss')."""
-    return sum(eval_f(weights, terms, x) != targets[x] for x in inputs)
-
-
-def term_label(term: tuple, n: int) -> str:
-    """Human-readable label, e.g. (0,2) → 'x0∧x2'."""
+def term_label(term):
     return "∧".join(f"x{i}" for i in term)
 
-
-def current_fn_str(weights, terms, n) -> str:
-    active = [term_label(t, n) for w, t in zip(weights, terms) if w]
+def current_fn_str(weights, terms):
+    active = [term_label(t) for w, t in zip(weights, terms) if w]
     return "f = " + " OR ".join(active) if active else "f = 0"
 
 
-# ── Boolean derivative ────────────────────────────────────────────────────────
+# ── data splitting ────────────────────────────────────────────────────────────
 
-def bool_derivative(weights: list[int], terms: list[tuple], x: tuple, term_idx: int) -> int:
+def make_dataset(n, target_fn, observed_fraction=0.5, seed=42):
     """
-    ∂f/∂w_i at input x.
+    Split the full truth table into train and test sets.
 
-    = f(w_i=0, x)  XOR  f(w_i=1, x)
+    Parameters
+    ----------
+    n                  : number of input variables
+    target_fn          : the true function  (tuple -> 0 or 1)
+    observed_fraction  : fraction of 2^n rows used for training
+    seed               : random seed for reproducibility
 
-    1 → flipping w_i changes the output at x  (term 'matters' here)
-    0 → flipping w_i does nothing at x
+    Returns
+    -------
+    train : dict  {input_tuple: label}   -- what the learner sees
+    test  : dict  {input_tuple: label}   -- held-out rows for evaluation
     """
+    rng = random.Random(seed)
+    all_rows = all_inputs(n)
+    rng.shuffle(all_rows)
+
+    n_train = max(1, int(len(all_rows) * observed_fraction))
+    train_rows = all_rows[:n_train]
+    test_rows  = all_rows[n_train:]
+
+    train = {x: target_fn(x) for x in train_rows}
+    test  = {x: target_fn(x) for x in test_rows}
+    return train, test
+
+
+# ── Boolean derivative & scoring ──────────────────────────────────────────────
+
+def bool_derivative(weights, terms, x, term_idx):
+    """df/dw_i at input x  =  f(w_i=0, x) XOR f(w_i=1, x)"""
     w0 = weights.copy(); w0[term_idx] = 0
     w1 = weights.copy(); w1[term_idx] = 1
     return eval_f(w0, terms, x) ^ eval_f(w1, terms, x)
 
+def compute_loss(weights, terms, data):
+    """Errors over the provided data rows only."""
+    return sum(eval_f(weights, terms, x) != y for x, y in data.items())
 
-def score_flip(weights, terms, inputs, targets, term_idx) -> int:
-    """
-    Net errors fixed by flipping w_i.
-    Analogous to the gradient magnitude — how much does this update help?
-    """
-    new_w = weights.copy()
-    new_w[term_idx] ^= 1
-    old_loss = compute_loss(weights, terms, inputs, targets)
-    new_loss = compute_loss(new_w, terms, inputs, targets)
-    return old_loss - new_loss          # positive = improvement
+def score_flip(weights, terms, data, term_idx):
+    """Net training errors fixed by flipping w_i."""
+    new_w = weights.copy(); new_w[term_idx] ^= 1
+    return compute_loss(weights, terms, data) - compute_loss(new_w, terms, data)
 
 
 # ── training loop ─────────────────────────────────────────────────────────────
 
-def train(
-    n: int,
-    target_fn,
-    max_steps: int = 200,
-    verbose: bool = True,
-) -> list[int]:
+def train(n, train_data, max_steps=300, verbose=True):
     """
-    Learn target_fn : {0,1}^n → {0,1} from its truth table.
-
-    Parameters
-    ----------
-    n          : number of input variables
-    target_fn  : callable (tuple of 0/1) → 0 or 1
-    max_steps  : stop after this many steps even if not converged
-    verbose    : print training log
-
-    Returns
-    -------
-    weights : learned weight vector over all AND-terms
+    Learn from train_data only -- a subset of the truth table.
     """
-    inputs  = all_inputs(n)
-    targets = {x: target_fn(x) for x in inputs}
     terms   = generate_terms(n)
     k       = len(terms)
-
-    # Start with all weights = 0  (f = 0 everywhere, like zero-init)
     weights = [0] * k
+    n_train = len(train_data)
+    n_total = 2 ** n
 
     if verbose:
-        print(f"\n{'='*60}")
-        print(f"  Boolean Function Learner  |  n={n} inputs, {k} candidate terms")
-        print(f"  Truth table: {len(inputs)} rows")
-        print(f"{'='*60}")
+        print(f"\n{'='*62}")
+        print(f"  Boolean Learner  |  n={n}  |  "
+              f"training on {n_train}/{n_total} rows ({100*n_train/n_total:.0f}%)")
+        print(f"  Candidate terms : {k}")
+        print(f"{'='*62}")
 
     for step in range(1, max_steps + 1):
-        loss = compute_loss(weights, terms, inputs, targets)
+        loss = compute_loss(weights, terms, train_data)
 
         if verbose:
-            print(f"\nStep {step:>3}  |  Loss: {loss}/{len(inputs)}  |  {current_fn_str(weights, terms, n)}")
+            print(f"\nStep {step:>3}  |  Train loss: {loss}/{n_train}"
+                  f"  |  {current_fn_str(weights, terms)}")
 
         if loss == 0:
             if verbose:
-                print("\n✓ Converged!")
+                print("  ✓ Zero training loss.")
             break
 
-        # ── pick the first error row (like picking a training sample) ─────────
-        error_x = next(x for x in inputs if eval_f(weights, terms, x) != targets[x])
+        # first wrong training row
+        error_x = next(x for x, y in train_data.items()
+                       if eval_f(weights, terms, x) != y)
 
-        if verbose:
-            got      = eval_f(weights, terms, error_x)
-            expected = targets[error_x]
-            xstr     = "(" + ", ".join(f"x{i}={v}" for i,v in enumerate(error_x)) + ")"
-            print(f"         Error at {xstr}: got {got}, expected {expected}")
-
-        # ── Boolean derivatives at the error point ────────────────────────────
         derivs = [bool_derivative(weights, terms, error_x, i) for i in range(k)]
+        scores = [score_flip(weights, terms, train_data, i) for i in range(k)]
 
-        if verbose:
-            active_derivs = [(term_label(terms[i], n), derivs[i])
-                             for i in range(k) if derivs[i] == 1]
-            labels = ", ".join(f"{l}→1" for l,_ in active_derivs) or "none"
-            print(f"         ∂f/∂w  non-zero: [{labels}]")
-
-        # ── score every possible flip (like computing gradient for each weight)
-        scores = [score_flip(weights, terms, inputs, targets, i) for i in range(k)]
-
-        best_i = max(range(k), key=lambda i: scores[i])
+        best_i     = max(range(k), key=lambda i: scores[i])
         best_score = scores[best_i]
 
         if best_score <= 0:
             if verbose:
-                print("         No single flip improves loss — stopping early.")
+                print("  ✗ No single flip improves training loss — stopping.")
             break
 
-        # ── update (the Boolean gradient step) ───────────────────────────────
         weights[best_i] ^= 1
-        action = "ADD " if weights[best_i] else "REMOVE"
+        action = "ADD   " if weights[best_i] else "REMOVE"
 
         if verbose:
-            print(f"         → {action} [{term_label(terms[best_i], n)}]  "
-                  f"(fixes {best_score} error{'s' if best_score!=1 else ''})")
-
+            active_d = [term_label(terms[i]) for i in range(k) if derivs[i]]
+            xstr = "(" + " ".join(f"x{i}={v}" for i, v in enumerate(error_x)) + ")"
+            print(f"  Error  : {xstr}  expected={train_data[error_x]}")
+            print(f"  df/dw  : [{', '.join(active_d) or 'none'}]")
+            print(f"  Update : {action} [{term_label(terms[best_i])}]"
+                  f"  (fixes {best_score} training error{'s' if best_score != 1 else ''})")
     else:
         if verbose:
-            print(f"\n✗ Did not converge in {max_steps} steps.")
+            print(f"\n  ✗ Did not converge within {max_steps} steps.")
 
     return weights
 
 
-# ── verification ──────────────────────────────────────────────────────────────
+# ── evaluation ────────────────────────────────────────────────────────────────
 
-def verify(weights, terms, n, target_fn, verbose=True):
-    inputs  = all_inputs(n)
-    targets = {x: target_fn(x) for x in inputs}
-    errors  = 0
+def evaluate(weights, terms, train_data, test_data, verbose=True):
+    """
+    Report accuracy on both train (seen) and test (unseen) rows.
+    This is the generalization check.
+    """
+    def accuracy(data):
+        if not data:
+            return 0, 0
+        correct = sum(eval_f(weights, terms, x) == y for x, y in data.items())
+        return correct, len(data)
+
+    tr_ok, tr_n = accuracy(train_data)
+    te_ok, te_n = accuracy(test_data)
 
     if verbose:
-        header = "  " + "  ".join(f"x{i}" for i in range(n)) + "  target  learned"
-        print(f"\n{'='*60}")
-        print("  Final truth table")
-        print(f"{'='*60}")
-        print(header)
-        print("  " + "-"*(len(header)-2))
+        print(f"\n{'='*62}")
+        print(f"  Results")
+        print(f"{'='*62}")
+        print(f"  Learned  : {current_fn_str(weights, terms)}")
+        print(f"\n  Train accuracy :  {tr_ok}/{tr_n}  ({100*tr_ok/tr_n:.0f}%)  <- rows it trained on")
+        if te_n > 0:
+            print(f"  Test  accuracy :  {te_ok}/{te_n}  ({100*te_ok/te_n:.0f}%)  <- rows it never saw")
+        else:
+            print(f"  Test  accuracy :  N/A  (trained on full dataset)")
 
-    for x in inputs:
-        got = eval_f(weights, terms, x)
-        tgt = targets[x]
-        ok  = got == tgt
-        if not ok:
-            errors += 1
-        if verbose:
-            bits = "  ".join(str(v) for v in x)
-            mark = "✓" if ok else "✗ ← error"
-            print(f"  {bits}     {tgt}        {got}    {mark}")
+        if te_n > 0 and te_ok < te_n:
+            missed = [(x, eval_f(weights, terms, x), y)
+                      for x, y in test_data.items()
+                      if eval_f(weights, terms, x) != y]
+            print(f"\n  Generalization misses ({len(missed)}):")
+            for x, got, expected in missed:
+                xstr = "(" + " ".join(f"x{i}={v}" for i, v in enumerate(x)) + ")"
+                print(f"    {xstr}  predicted={got}  true={expected}")
 
-    if verbose:
-        print(f"\n  Accuracy: {len(inputs)-errors}/{len(inputs)} rows correct")
-        print(f"  Learned function: {current_fn_str(weights, terms, n)}")
-
-    return errors == 0
-
-
-# ── example functions to learn ────────────────────────────────────────────────
-
-def majority(x: tuple) -> int:
-    """Output 1 if more than half the inputs are 1."""
-    return int(sum(x) > len(x) / 2)
+    tr_acc = tr_ok / tr_n if tr_n else 0
+    te_acc = te_ok / te_n if te_n else None
+    return tr_acc, te_acc
 
 
-def parity(x: tuple) -> int:
-    """Output 1 if an odd number of inputs are 1 (XOR for n inputs)."""
-    return sum(x) % 2
+# ── example functions ─────────────────────────────────────────────────────────
 
-
-def at_least_two(x: tuple) -> int:
-    """Output 1 if at least 2 inputs are 1."""
-    return int(sum(x) >= 2)
-
-
-def custom_fn(x: tuple) -> int:
-    """
-    Example: define your own function here.
-    x is a tuple of 0/1 values, one per input variable.
-    """
-    x0, x1, x2, x3 = x
-    return int((x0 and not x1) or (x2 and x3))
+def majority(x):      return int(sum(x) > len(x) / 2)
+def parity(x):        return sum(x) % 2
+def at_least_two(x):  return int(sum(x) >= 2)
 
 
 # ── main ──────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
 
-    examples = [
-        ("Majority (n=3)",    3, majority),
-        ("Majority (n=5)",    5, majority),
-        ("Parity/XOR (n=3)",  3, parity),
-        ("At-least-two (n=4)",4, at_least_two),
-        ("Custom (n=4)",      4, custom_fn),
+    runs = [
+        # (description,              n,  target_fn,    frac)
+        ("Majority n=3, 100% data",  3,  majority,     1.00),  # baseline
+        ("Majority n=3,  75% data",  3,  majority,     0.75),
+        ("Majority n=3,  50% data",  3,  majority,     0.50),
+        ("Majority n=3,  25% data",  3,  majority,     0.25),
+        ("At-least-two n=4, 50%",    4,  at_least_two, 0.50),
+        ("At-least-two n=4, 25%",    4,  at_least_two, 0.25),
     ]
 
-    for name, n, fn in examples:
-        print(f"\n\n{'#'*60}")
-        print(f"  EXAMPLE: {name}")
-        print(f"{'#'*60}")
-        weights = train(n, fn, verbose=True)
+    for desc, n, fn, frac in runs:
+        print(f"\n\n{'#'*62}")
+        print(f"  {desc}")
+        print(f"{'#'*62}")
+        train_data, test_data = make_dataset(n, fn, observed_fraction=frac)
+        weights = train(n, train_data, verbose=True)
         terms   = generate_terms(n)
-        verify(weights, terms, n, fn, verbose=True)
-        input("\n  Press Enter for next example...")
+        evaluate(weights, terms, train_data, test_data, verbose=True)
+        input("\n  Press Enter for next run...")
