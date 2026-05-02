@@ -74,8 +74,6 @@ Update: w -= lr × grad  →        Update: flip w (no learning rate needed)
 
 This works because `x` and `y` are both `0`, making the `AND` term dead regardless. Only `z` matters. Exactly like a neural network where some weights are in a saturated region and their gradients are zero.
 
-**Deliverable:** Interactive visual demo with step-by-step derivative computation for each variable.
-
 ---
 
 ### Step 2 — Learning Boolean functions from a truth table
@@ -116,8 +114,6 @@ Starting from `f = 0` (all weights zero), the learner:
 - **Greedy local minima**: a locally good step can trap the learner
 - **XOR/parity failure**: SOP with one OR-of-AND layer is equivalent to a single-layer perceptron — it provably cannot represent XOR
 
-**Deliverable:** Python script + interactive HTML demo with live truth table, derivative display, and training log.
-
 ---
 
 ### Step 3 — Partial data: train/test split
@@ -143,8 +139,6 @@ Fraction of data  Train acc  Test acc  What happened
 ```
 
 The 25% run actually *generalized better* than the 50% run — with fewer examples to memorize, it was forced into a simpler, more general hypothesis. This is the **bias-variance tradeoff** appearing naturally.
-
-**Deliverable:** Updated Python script with `make_dataset()`, `evaluate()` reporting both train/test accuracy, and generalization miss analysis.
 
 ---
 
