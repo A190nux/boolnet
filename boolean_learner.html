@@ -1,0 +1,247 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Boolean Function Learner</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: system-ui, sans-serif; background: #f8f8f6; color: #1a1a18; padding: 1.5rem; min-height: 100vh; }
+  h1 { font-size: 16px; font-weight: 500; margin-bottom: 4px; }
+  .subtitle { font-size: 12px; color: #666; margin-bottom: 1rem; }
+
+  .header { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 1rem; gap: 8px; flex-wrap: wrap; }
+  .metrics { display: flex; gap: 8px; }
+  .metric { background: #efefed; border: 1px solid #ddddd8; border-radius: 8px; padding: 6px 14px; text-align: center; min-width: 64px; }
+  .metric-label { font-size: 10px; color: #888; text-transform: uppercase; letter-spacing: .04em; }
+  .metric-val { font-size: 20px; font-weight: 500; }
+  .good { color: #18794e; }
+  .bad { color: #c0392b; }
+  .muted { color: #666; }
+
+  .main-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 12px; }
+  @media(max-width:600px){ .main-grid { grid-template-columns: 1fr; } }
+
+  .panel { background: #fff; border: 1px solid #ddddd8; border-radius: 12px; padding: 1rem; }
+  .panel-title { font-size: 10px; color: #888; text-transform: uppercase; letter-spacing: .05em; font-weight: 600; margin-bottom: 10px; }
+
+  table.tt { width: 100%; border-collapse: collapse; font-size: 12px; font-family: monospace; }
+  table.tt th { font-size: 10px; color: #888; padding: 3px 6px; border-bottom: 1px solid #eee; text-align: center; font-weight: 600; font-family: system-ui, sans-serif; }
+  table.tt td { padding: 4px 6px; text-align: center; transition: background 0.2s; }
+  table.tt tr.correct td { color: #1a1a18; }
+  table.tt tr.wrong td { background: #fdecea; }
+  table.tt tr.wrong .status { color: #c0392b; font-weight: 600; }
+  table.tt tr.correct .status { color: #18794e; }
+  table.tt tr.active-row td { outline: 2px solid #3b82f6; outline-offset: -1px; }
+
+  .fn-expr { font-family: monospace; font-size: 11px; color: #666; margin-bottom: 10px; line-height: 1.5; word-break: break-word; min-height: 32px; }
+
+  .terms { display: flex; flex-direction: column; gap: 5px; }
+  .term-row { display: flex; align-items: center; gap: 8px; padding: 5px 8px; border-radius: 6px; border: 1px solid #ddddd8; transition: all 0.25s; }
+  .term-row.active { background: #ecfdf5; border-color: #6ee7b7; }
+  .term-row.inactive { background: #fafaf8; }
+  .term-row.flash { background: #eff6ff; border-color: #93c5fd; }
+  .dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; }
+  .dot.on { background: #18794e; }
+  .dot.off { background: #ccc; }
+  .dot.hi { background: #3b82f6; }
+  .term-lbl { font-family: monospace; font-size: 12px; flex: 1; }
+  .badge { font-size: 10px; padding: 1px 6px; border-radius: 10px; }
+  .badge.inc { background: #ecfdf5; color: #18794e; border: 1px solid #6ee7b7; }
+  .badge.exc { background: #f0f0ee; color: #888; border: 1px solid #ddd; }
+  .badge.flp { background: #eff6ff; color: #2563eb; border: 1px solid #93c5fd; }
+
+  .controls { display: flex; gap: 8px; margin-bottom: 12px; flex-wrap: wrap; }
+  button { background: #fff; border: 1px solid #ccc; border-radius: 7px; padding: 7px 14px; font-size: 13px; cursor: pointer; font-family: inherit; color: #1a1a18; transition: background 0.15s; }
+  button:hover { background: #f0f0ee; }
+  button:active { transform: scale(0.98); }
+
+  .log { display: flex; flex-direction: column; gap: 6px; max-height: 250px; overflow-y: auto; }
+  .log-entry { font-size: 11.5px; padding: 8px 10px; border-radius: 6px; border: 1px solid #ddddd8; background: #fafaf8; line-height: 1.7; }
+  .log-entry.latest { border-color: #93c5fd; background: #fafcff; }
+  .tag { display: inline; font-family: monospace; font-size: 10px; padding: 1px 5px; border-radius: 4px; margin: 0 1px; }
+  .tag.d1 { background: #eff6ff; color: #2563eb; border: 1px solid #bfdbfe; }
+  .tag.d0 { background: #f0f0ee; color: #888; }
+  .tag.fix { background: #ecfdf5; color: #18794e; font-weight: 600; }
+  .tag.err { background: #fdecea; color: #c0392b; font-weight: 600; }
+  .tag.neu { background: #f0f0ee; color: #444; }
+
+  .analogy-box { background: #fafaf8; border: 1px solid #ddddd8; border-radius: 10px; padding: .875rem 1rem; margin-bottom: 12px; font-size: 12px; color: #555; line-height: 1.6; }
+  .analogy-box strong { color: #1a1a18; }
+</style>
+</head>
+<body>
+
+<div class="analogy-box">
+  <strong>How it works:</strong> The function is represented as a Sum of Products (SOP) — a set of AND-terms ORed together. Each term has a binary "weight" (include / exclude). At each step, the Boolean derivative ∂f/∂term tells us which term to add or remove to fix the current error — exactly like backpropagation finds which weight to adjust in a neural network.
+</div>
+
+<div class="header">
+  <div>
+    <h1>Boolean function learner</h1>
+    <div class="subtitle">Target: majority(x,y,z) — output 1 when ≥ 2 inputs are 1 &nbsp;|&nbsp; Starts wrong: f = x ∧ y</div>
+  </div>
+  <div class="metrics">
+    <div class="metric"><div class="metric-label">Step</div><div class="metric-val muted" id="epoch-val">0</div></div>
+    <div class="metric"><div class="metric-label">Errors</div><div class="metric-val bad" id="loss-val">2/8</div></div>
+  </div>
+</div>
+
+<div class="main-grid">
+  <div class="panel">
+    <div class="panel-title">Truth table — forward pass</div>
+    <table class="tt">
+      <thead><tr><th>x</th><th>y</th><th>z</th><th>target</th><th>current</th><th></th></tr></thead>
+      <tbody id="tt-body"></tbody>
+    </table>
+  </div>
+  <div class="panel">
+    <div class="panel-title">Current function (SOP) — parameters</div>
+    <div class="fn-expr" id="fn-expr">f = x ∧ y</div>
+    <div class="terms" id="terms-list"></div>
+  </div>
+</div>
+
+<div class="controls">
+  <button id="step-btn" onclick="doStep()">Step →</button>
+  <button id="auto-btn" onclick="toggleAuto()">Auto train ↗</button>
+  <button onclick="doReset()">Reset</button>
+</div>
+
+<div class="panel">
+  <div class="panel-title">Training log — Boolean derivatives at each step</div>
+  <div class="log" id="log"><div style="font-size:12px;color:#aaa;">Press Step or Auto train to begin...</div></div>
+</div>
+
+<script>
+const TERMS = [
+  {label:'x',      fn:(x,y,z)=>x},
+  {label:'y',      fn:(x,y,z)=>y},
+  {label:'z',      fn:(x,y,z)=>z},
+  {label:'x ∧ y',  fn:(x,y,z)=>x&y},
+  {label:'x ∧ z',  fn:(x,y,z)=>x&z},
+  {label:'y ∧ z',  fn:(x,y,z)=>y&z},
+  {label:'x∧y∧z', fn:(x,y,z)=>x&y&z},
+];
+
+const INPUTS=[];
+for(let x=0;x<=1;x++)for(let y=0;y<=1;y++)for(let z=0;z<=1;z++)INPUTS.push({x,y,z});
+
+function target(x,y,z){return(x+y+z>=2)?1:0;}
+
+let weights=[0,0,0,1,0,0,0];
+let epoch=0,autoTimer=null,flashTerm=-1,flashRow=-1;
+
+function evalF(x,y,z,w){
+  const ww=w||weights;
+  for(let i=0;i<TERMS.length;i++)if(ww[i]&&TERMS[i].fn(x,y,z))return 1;
+  return 0;
+}
+function getLoss(w){
+  return INPUTS.filter(({x,y,z})=>evalF(x,y,z,w||weights)!==target(x,y,z)).length;
+}
+function getErrors(){
+  return INPUTS.map((inp,i)=>({...inp,i,curr:evalF(inp.x,inp.y,inp.z),tgt:target(inp.x,inp.y,inp.z)})).filter(e=>e.curr!==e.tgt);
+}
+
+function renderTT(){
+  const body=document.getElementById('tt-body');body.innerHTML='';
+  INPUTS.forEach(({x,y,z},i)=>{
+    const curr=evalF(x,y,z),tgt=target(x,y,z),ok=curr===tgt;
+    const tr=document.createElement('tr');
+    tr.className=(ok?'correct':'wrong')+(i===flashRow?' active-row':'');
+    tr.innerHTML=`<td>${x}</td><td>${y}</td><td>${z}</td><td>${tgt}</td><td>${curr}</td><td class="status">${ok?'✓':'✗'}</td>`;
+    body.appendChild(tr);
+  });
+}
+function renderTerms(){
+  const list=document.getElementById('terms-list');list.innerHTML='';
+  const active=TERMS.map((t,i)=>weights[i]?t.label:null).filter(Boolean);
+  document.getElementById('fn-expr').textContent=active.length?'f = '+active.join(' OR '):'f = 0 (always false)';
+  TERMS.forEach((t,i)=>{
+    const div=document.createElement('div');
+    let cls='term-row ';
+    if(i===flashTerm)cls+='flash';else if(weights[i])cls+='active';else cls+='inactive';
+    div.className=cls;
+    div.innerHTML=`<div class="dot ${i===flashTerm?'hi':weights[i]?'on':'off'}"></div><div class="term-lbl">${t.label}</div><div class="badge ${i===flashTerm?'flp':weights[i]?'inc':'exc'}">${i===flashTerm?'↻ updating':weights[i]?'included':'excluded'}</div>`;
+    list.appendChild(div);
+  });
+}
+function renderMetrics(){
+  document.getElementById('epoch-val').textContent=epoch;
+  const loss=getLoss();
+  const lv=document.getElementById('loss-val');
+  lv.textContent=loss+'/8';lv.className='metric-val '+(loss===0?'good':'bad');
+}
+function addLog(html){
+  const log=document.getElementById('log');
+  log.querySelectorAll('.latest').forEach(e=>e.classList.remove('latest'));
+  const div=document.createElement('div');div.className='log-entry latest';div.innerHTML=html;
+  log.insertBefore(div,log.firstChild);
+}
+
+function doStep(){
+  if(getLoss()===0){addLog('<span style="color:#18794e;font-weight:500;">✓ Already converged!</span>');return;}
+  epoch++;
+  const errors=getErrors();
+  const err=errors[0];
+  const inputStr=`(x=${err.x}, y=${err.y}, z=${err.z})`;
+
+  // Boolean derivative ∂f/∂term_i at error point
+  const derivs=TERMS.map((_,i)=>{
+    const w0=[...weights];w0[i]=0;
+    const w1=[...weights];w1[i]=1;
+    return evalF(err.x,err.y,err.z,w0)^evalF(err.x,err.y,err.z,w1);
+  });
+
+  // Score: how many total errors does flipping term i fix?
+  const scores=TERMS.map((_,i)=>{
+    const nw=[...weights];nw[i]=1-nw[i];
+    return errors.length-getLoss(nw);
+  });
+
+  let bestI=0,bestScore=-Infinity;
+  for(let i=0;i<TERMS.length;i++)if(scores[i]>bestScore){bestScore=scores[i];bestI=i;}
+
+  flashRow=INPUTS.findIndex(inp=>inp.x===err.x&&inp.y===err.y&&inp.z===err.z);
+  flashTerm=bestI;
+  renderTT();renderTerms();
+
+  setTimeout(()=>{
+    weights[bestI]=1-weights[bestI];
+    const action=weights[bestI]?'Added':'Removed';
+    flashTerm=-1;flashRow=-1;
+    const newLoss=getLoss();
+
+    const derivTags=TERMS.map((t,i)=>`<span class="tag ${derivs[i]?'d1':'d0'}" title="∂f/∂(${t.label}) = ${derivs[i]}">${t.label}:${derivs[i]}</span>`).join(' ');
+    addLog(`<div><strong>Step ${epoch}</strong> — Error at <span class="tag neu">${inputStr}</span>: expected <span class="tag fix">${err.tgt}</span>, got <span class="tag err">${err.curr}</span></div><div style="margin-top:4px;">∂f/∂term &nbsp;→&nbsp; ${derivTags}</div><div style="margin-top:4px;"><span class="tag fix">${action} "${TERMS[bestI].label}"</span> — fixes ${bestScore} error${bestScore!==1?'s':''} &nbsp;|&nbsp; Loss: ${errors.length}/8 → ${newLoss}/8</div>`);
+
+    renderTT();renderTerms();renderMetrics();
+    if(newLoss===0){
+      setTimeout(()=>addLog(`<span style="color:#18794e;font-weight:500;">✓ Training complete — majority function learned in ${epoch} steps.</span>`),200);
+      if(autoTimer){clearInterval(autoTimer);autoTimer=null;document.getElementById('auto-btn').textContent='Auto train ↗';}
+    }
+  },400);
+}
+
+function toggleAuto(){
+  if(autoTimer){clearInterval(autoTimer);autoTimer=null;document.getElementById('auto-btn').textContent='Auto train ↗';return;}
+  document.getElementById('auto-btn').textContent='Stop ■';
+  autoTimer=setInterval(()=>{
+    if(getLoss()===0){clearInterval(autoTimer);autoTimer=null;document.getElementById('auto-btn').textContent='Auto train ↗';return;}
+    doStep();
+  },1100);
+}
+
+function doReset(){
+  if(autoTimer){clearInterval(autoTimer);autoTimer=null;}
+  document.getElementById('auto-btn').textContent='Auto train ↗';
+  weights=[0,0,0,1,0,0,0];epoch=0;flashTerm=-1;flashRow=-1;
+  document.getElementById('log').innerHTML='<div style="font-size:12px;color:#aaa;">Press Step or Auto train to begin...</div>';
+  renderTT();renderTerms();renderMetrics();
+}
+
+renderTT();renderTerms();renderMetrics();
+</script>
+</body>
+</html>
