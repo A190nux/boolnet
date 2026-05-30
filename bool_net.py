@@ -100,22 +100,42 @@ class BooleanLayer:
     def __init__(self, input_width: int, output_width: int, rng: random.Random):
         self.input_width  = input_width
         self.output_width = output_width
+        # input_width is always even (augmented signals)
+        m = input_width // 2
 
-        # W is stored as a list-of-lists: W[input_index][neuron_index]
-        # Initialize randomly, ensuring no all-zero or all-one columns.
         self.W = [[0] * output_width for _ in range(input_width)]
 
         for j in range(output_width):
-            # Keep sampling until we get a column with at least 1 connection
-            # and at least 1 gap (i.e., the neuron is neither trivial nor
-            # impossible to satisfy).
+            # Build a single column, pair by pair
+            col = [0] * input_width
             while True:
-                col = [rng.randint(0, 1) for _ in range(input_width)]
-                n_ones = sum(col)
-                if 0 < n_ones < input_width:
-                    for i in range(input_width):
-                        self.W[i][j] = col[i]
+                # For each original signal i, randomly choose one of the
+                # three allowed (non-contradictory) patterns.
+                for i in range(m):
+                    choice = rng.randint(0, 2)   # 0, 1, or 2
+                    if choice == 0:
+                        # (0,0) – no requirement on x_i
+                        col[i]     = 0
+                        col[i + m] = 0
+                    elif choice == 1:
+                        # (1,0) – require x_i = 1
+                        col[i]     = 1
+                        col[i + m] = 0
+                    else:
+                        # (0,1) – require x_i = 0 (i.e., require ¬x_i = 1)
+                        col[i]     = 0
+                        col[i + m] = 1
+
+                # Reject the all‑zero column (neuron would always fire)
+                if any(col[i] == 1 for i in range(input_width)):
                     break
+                # Else (very rare): retry. We can also just flip one pair:
+                # but the while loop is fine because probability of all-zero
+                # is tiny: (1/3)^m, so it will rarely loop more than once.
+
+            # Copy the valid column into W
+            for i in range(input_width):
+                self.W[i][j] = col[i]
 
     def forward(self, x: tuple) -> tuple:
         """

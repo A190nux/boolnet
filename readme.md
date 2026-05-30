@@ -329,7 +329,19 @@ In a real neural network this is called the **dying ReLU problem**: a neuron who
 
 **Why it happens:** the random `{0,1}` initialization does not check for contradictions between a variable and its complement in the same column. When both `x₀` and `¬x₀` are required by the same neuron, the neuron can never fire.
 
-**Status:** Known, not yet fixed.
+**Fix:**  The weight matrix is now built column‑by‑column, enforcing
+that no neuron can ever require both a variable and its complement.
+Each original signal `x_i` is assigned one of three allowed patterns:
+
+- `(0,0)` — neuron ignores `x_i`
+- `(1,0)` — neuron requires `x_i = 1`
+- `(0,1)` — neuron requires `x_i = 0`
+
+This guarantees every neuron is satisfiable from the start.
+The initialization runs in linear time and produces a uniform
+distribution over all valid masks.
+
+**Status:** Fixed.
 
 ---
 
