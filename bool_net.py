@@ -337,6 +337,28 @@ class BooleanNetwork:
             _, j = wid
             self.out_w[j] ^= 1
 
+    def is_safe_flip(self, wid) -> bool:
+        """
+        Return True if flipping this weight would NOT create a contradiction
+        (i.e., a neuron requiring both a signal and its complement).
+        """
+        if wid[0] == 'out':
+            return True   # output weights are independent
+
+        _, k, i, j = wid
+        layer = self.layers[k]
+        current = layer.W[i][j]
+
+        # Flipping 1 → 0 is always safe (removing a requirement never
+        # introduces a contradiction).
+        if current == 1:
+            return True
+
+        # Flipping 0 → 1: must ensure the complement in the same column is 0.
+        m = layer.input_width // 2          # number of original signals
+        i_comp = i + m if i < m else i - m
+        return layer.W[i_comp][j] == 0
+
     def compute_derivative(self, x: tuple, wid) -> int:
         """Dispatch derivative computation based on weight type."""
         if wid[0] == 'layer':
@@ -414,20 +436,23 @@ def train(
     train_data: dict,
     max_steps:  int  = 500,
     verbose:    bool = True,
+    pair_strategy: str = 'aggressive',   # 'aggressive' or 'hybrid'
 ) -> BooleanNetwork:
     """
     Train the network on train_data using Boolean derivative guided search.
 
     At each step:
       1. Forward pass over all training rows → compute loss.
-      2. Pick the first wrong row (the 'training sample' for this step).
-      3. Compute Boolean derivative for every weight at that error input.
-         Only weights with derivative = 1 can possibly fix this error.
-      4. Among those candidates, score each flip globally across all
-         training rows (greedy search — analogous to picking the weight
-         with the largest gradient magnitude).
-      5. Apply the best flip.
-      6. Repeat until loss = 0 or no improvement is possible.
+      2. Collect all misclassified rows and try each one in turn.
+      3. For each such error row, compute Boolean derivatives; stop at the
+         first row that yields any non-zero derivative.
+      4. Among those candidates, score each flip globally.
+         If a beneficial single flip exists, apply it and continue.
+      5. If no single flip helps, try all pairs of weights (joint derivative)
+         on all error rows, score the beneficial pairs globally, and apply the best.
+      6. If still no improvement, flip a small random subset of weights
+         (perturbation) to escape the local minimum, then continue.
+      7. Repeat until loss = 0 or stuck counter exceeds MAX_STUCK.
 
     Parameters
     ──────────
@@ -436,8 +461,10 @@ def train(
     max_steps  : hard step limit
     verbose    : print step-by-step log
     """
+    MAX_STUCK = 5
     n_train = len(train_data)
     n_total = 2 ** net.n_inputs
+    stuck_counter = 0
 
     if verbose:
         print(f"\n{'='*64}")
@@ -457,74 +484,323 @@ def train(
                 print("  ✓ Zero training loss — converged.")
             break
 
-        # ── Step 2: find the first misclassified training row ─────────────
-        error_x = next(x for x, y in train_data.items() if net(x) != y)
-        expected = train_data[error_x]
-        got      = net(error_x)
+        # ── Collect all misclassified rows ─────────────────────────────
+        error_rows = [x for x, y in train_data.items() if net(x) != y]
 
-        if verbose:
-            xstr = "(" + " ".join(f"x{i}={v}" for i, v in enumerate(error_x)) + ")"
-            print(f"         Error at {xstr}: got={got}, expected={expected}")
+        # ── Single‑flip search ─────────────────────────────────────────
+        single_candidates = []
+        chosen_error_x = None
+        chosen_expected = None
+        chosen_got = None
 
-        # ── Step 3: Boolean derivatives at error_x ────────────────────────
-        # A weight with derivative=0 at this input is provably irrelevant
-        # here — flipping it cannot fix this particular error.
-        # We only pay the scoring cost for weights where derivative=1.
-        candidates = []
-        for wid in net.all_weight_ids():
-            d = net.compute_derivative(error_x, wid)
-            if d == 1:
-                candidates.append(wid)
+        for error_x in error_rows:
+            expected = train_data[error_x]
+            got      = net(error_x)
+            last_error_x  = error_x
+            last_expected = expected
+            last_got      = got
 
-        if verbose:
-            n_layer_cands = sum(1 for w in candidates if w[0]=='layer')
-            n_out_cands   = sum(1 for w in candidates if w[0]=='out')
-            print(f"         Non-zero derivatives: "
-                  f"{n_layer_cands} layer weights, {n_out_cands} output weights")
+            for wid in net.all_weight_ids():
+                if net.compute_derivative(error_x, wid) == 1:
+                    single_candidates.append(wid)
 
-        if not candidates:
+            if single_candidates:
+                chosen_error_x = error_x
+                chosen_expected = expected
+                chosen_got = got
+                break
+
+        single_success = False
+        if single_candidates:
             if verbose:
-                print("  ✗ No weight has non-zero derivative at error point — stuck.")
-            break
+                xstr = "(" + " ".join(f"x{i}={v}" for i, v in enumerate(chosen_error_x)) + ")"
+                print(f"         Error at {xstr}: got={chosen_got}, expected={chosen_expected}")
+                n_layer = sum(1 for w in single_candidates if w[0]=='layer')
+                n_out   = sum(1 for w in single_candidates if w[0]=='out')
+                print(f"         Non-zero derivatives: {n_layer} layer, {n_out} output")
 
-        # ── Step 4: score all candidates globally ────────────────────────
-        scores   = {wid: score_flip(net, train_data, wid) for wid in candidates}
-        best_wid = max(scores, key=lambda w: scores[w])
-        best_score = scores[best_wid]
+            scores = {wid: score_flip(net, train_data, wid) for wid in single_candidates}
+            best_wid = max(scores, key=lambda w: scores[w])
+            best_score = scores[best_wid]
 
-        if best_score <= 0:
-            if verbose:
-                print("  ✗ No candidate flip reduces total training loss — stopping.")
-            break
+            if best_score > 0:
+                net.flip_weight(best_wid)
+                if verbose:
+                    _log_flip(net, best_wid, best_score)
+                stuck_counter = 0
+                single_success = True
 
-        # ── Step 5: apply the flip ────────────────────────────────────────
-        net.flip_weight(best_wid)
+        if single_success:
+            continue
 
+        # ── Pair‑flip search (strategy‑selected) ─────────────────────────
         if verbose:
-            kind = best_wid[0]
-            if kind == 'layer':
-                _, k, i, j = best_wid
-                new_val = net.layers[k].W[i][j]
-                action  = "ADD" if new_val else "REMOVE"
-                prev_n  = net.n_inputs if k == 0 else net.layer_widths[k-1]
-                inp_str = f"x{i-prev_n}" if i >= prev_n else f"x{i}"
-                if i >= prev_n:
-                    inp_str = f"¬x{i - prev_n}"
-                print(f"         → {action} connection "
-                      f"[Layer {k}, input {inp_str} → neuron {j}]  "
-                      f"(fixes {best_score} error{'s' if best_score!=1 else ''})")
+            if single_candidates:
+                print("         No single flip improves loss — trying pairs...")
             else:
-                _, j = best_wid
-                new_val = net.out_w[j]
-                action  = "CONNECT" if new_val else "DISCONNECT"
-                print(f"         → {action} output neuron {j}  "
-                      f"(fixes {best_score} error{'s' if best_score!=1 else ''})")
+                print("         No non‑zero derivatives — trying pairs...")
 
+        all_wids = list(net.all_weight_ids())
+        pair_success = False
+
+        if pair_strategy == 'aggressive':
+            # ── AGGRESSIVE: fast, active‑only, single‑row ──────────────
+            # Collect active weights (derivative=1 on ANY error row) with early exit
+            active_wids = set()
+            for wid in all_wids:
+                for err_x in error_rows:
+                    if net.compute_derivative(err_x, wid) == 1:
+                        active_wids.add(wid)
+                        break   # move to next weight as soon as it's active
+
+            if active_wids:
+                search_wids = list(active_wids)
+                if verbose:
+                    print(f"         Active weights: {len(active_wids)} / {len(all_wids)}")
+
+                # Test pairs among active_wids on the first error row only
+                first_err = error_rows[0]
+                orig_out = net(first_err)
+                pair_candidates = []
+                for a in range(len(search_wids)):
+                    wa = search_wids[a]
+                    for b in range(a + 1, len(search_wids)):
+                        wb = search_wids[b]
+                        net.flip_weight(wa)
+                        net.flip_weight(wb)
+                        flipped_out = net(first_err)
+                        net.flip_weight(wb)
+                        net.flip_weight(wa)
+                        if flipped_out != orig_out:
+                            pair_candidates.append((wa, wb))
+
+                if pair_candidates:
+                    pair_scores = {}
+                    for wa, wb in pair_candidates:
+                        pair_scores[(wa, wb)] = _score_pair_flip(net, train_data, wa, wb)
+                    best_pair = max(pair_scores, key=lambda k: pair_scores[k])
+                    best_pair_score = pair_scores[best_pair]
+
+                    if best_pair_score > 0:
+                        net.flip_weight(best_pair[0])
+                        net.flip_weight(best_pair[1])
+                        if verbose:
+                            print(f"         → PAIR FLIP (aggressive): {best_pair} fixes {best_pair_score} errors")
+                        stuck_counter = 0
+                        pair_success = True
+            else:
+                if verbose:
+                    print("         No active weights — falling through to perturbation.")
+
+        elif pair_strategy == 'hybrid':
+            # ── HYBRID: scan all error rows, fallback to full search ────
+            # 1. Build a global active set (derivative=1 on ANY row)
+            active_wids = set()
+            for wid in all_wids:
+                for err_x in error_rows:
+                    if net.compute_derivative(err_x, wid) == 1:
+                        active_wids.add(wid)
+                        break
+
+            # If no active weights, use all weights
+            if active_wids:
+                search_wids = list(active_wids)
+                if verbose:
+                    print(f"         Active weights: {len(active_wids)} / {len(all_wids)}")
+            else:
+                search_wids = all_wids
+                if verbose:
+                    print(f"         No active weights — using all {len(all_wids)} weights")
+
+            # 2. Try each error row until a globally helpful pair is found
+            for test_row in error_rows:
+                orig_out = net(test_row)
+                pair_candidates = []
+                for a in range(len(search_wids)):
+                    wa = search_wids[a]
+                    for b in range(a + 1, len(search_wids)):
+                        wb = search_wids[b]
+                        net.flip_weight(wa)
+                        net.flip_weight(wb)
+                        flipped_out = net(test_row)
+                        net.flip_weight(wb)
+                        net.flip_weight(wa)
+                        if flipped_out != orig_out:
+                            pair_candidates.append((wa, wb))
+
+                if not pair_candidates:
+                    continue   # try next error row
+
+                # Score and apply if beneficial
+                pair_scores = {}
+                for wa, wb in pair_candidates:
+                    pair_scores[(wa, wb)] = _score_pair_flip(net, train_data, wa, wb)
+                best_pair = max(pair_scores, key=lambda k: pair_scores[k])
+                best_pair_score = pair_scores[best_pair]
+
+                if best_pair_score > 0:
+                    net.flip_weight(best_pair[0])
+                    net.flip_weight(best_pair[1])
+                    if verbose:
+                        print(f"         → PAIR FLIP (hybrid): {best_pair} fixes {best_pair_score} errors")
+                    stuck_counter = 0
+                    pair_success = True
+                    break
+
+            # 3. If still no success, fallback to full search on first row
+            if not pair_success and active_wids:
+                if verbose:
+                    print("         Hybrid: falling back to full pair search on first row...")
+                first_err = error_rows[0]
+                orig_out = net(first_err)
+                pair_candidates = []
+                for a in range(len(all_wids)):
+                    wa = all_wids[a]
+                    for b in range(a + 1, len(all_wids)):
+                        wb = all_wids[b]
+                        net.flip_weight(wa)
+                        net.flip_weight(wb)
+                        flipped_out = net(first_err)
+                        net.flip_weight(wb)
+                        net.flip_weight(wa)
+                        if flipped_out != orig_out:
+                            pair_candidates.append((wa, wb))
+                if pair_candidates:
+                    pair_scores = {}
+                    for wa, wb in pair_candidates:
+                        pair_scores[(wa, wb)] = _score_pair_flip(net, train_data, wa, wb)
+                    best_pair = max(pair_scores, key=lambda k: pair_scores[k])
+                    best_pair_score = pair_scores[best_pair]
+                    if best_pair_score > 0:
+                        net.flip_weight(best_pair[0])
+                        net.flip_weight(best_pair[1])
+                        if verbose:
+                            print(f"         → PAIR FLIP (hybrid fallback): {best_pair} fixes {best_pair_score} errors")
+                        stuck_counter = 0
+                        pair_success = True
+        else:
+            raise ValueError(f"Unknown pair_strategy: {pair_strategy}")
+
+        if pair_success:
+            continue
+
+        # ── Random perturbation (last resort) ───────────────────────────
+        stuck_counter += 1
+        if stuck_counter > MAX_STUCK:
+            if verbose:
+                print(f"  ✗ Stuck {MAX_STUCK} times — stopping.")
+            break
+
+        # Flip a small random set of safe weights (increasing size)
+        safe_wids = [wid for wid in all_wids if net.is_safe_flip(wid)]
+        if not safe_wids:
+            # Should not happen, but fallback to any weight
+            safe_wids = all_wids
+
+        n_perturb = min(1 + stuck_counter // 2, 5)
+        n_perturb = min(n_perturb, len(safe_wids))
+        perturb_wids = random.sample(safe_wids, n_perturb)
+        for wid in perturb_wids:
+            net.flip_weight(wid)
+        if verbose:
+            print(f"  ↳ Random perturbation [{stuck_counter}/{MAX_STUCK}]: "
+                  f"flipped {len(perturb_wids)} safe weight(s)")
+            for wid in perturb_wids:
+                _log_flip(net, wid, None)
+                
     else:
         if verbose:
             print(f"\n  ✗ Did not converge within {max_steps} steps.")
 
     return net
+
+# ── Helper functions for logging ─────────────────────────────────────────────
+def _log_flip(net, wid, score):
+    """Pretty‑print a single weight flip."""
+    kind = wid[0]
+    if kind == 'layer':
+        _, k, i, j = wid
+        new_val = net.layers[k].W[i][j]
+        action  = "ADD" if new_val else "REMOVE"
+        prev_n  = net.n_inputs if k == 0 else net.layer_widths[k-1]
+        inp_str = f"x{i-prev_n}" if i >= prev_n else f"x{i}"
+        if i >= prev_n:
+            inp_str = f"¬x{i - prev_n}"
+        msg = f"         → {action} connection [Layer {k}, input {inp_str} → neuron {j}]"
+        if score is not None:
+            msg += f"  (fixes {score} error{'s' if score!=1 else ''})"
+        print(msg)
+    else:
+        _, j = wid
+        new_val = net.out_w[j]
+        action  = "CONNECT" if new_val else "DISCONNECT"
+        msg = f"         → {action} output neuron {j}"
+        if score is not None:
+            msg += f"  (fixes {score} error{'s' if score!=1 else ''})"
+        print(msg)
+
+
+def _score_pair_flip(net, data, wid_a, wid_b):
+    """How many errors does flipping both weights fix?"""
+    old_loss = compute_loss(net, data)
+    net.flip_weight(wid_a)
+    net.flip_weight(wid_b)
+    new_loss = compute_loss(net, data)
+    net.flip_weight(wid_b)
+    net.flip_weight(wid_a)
+    return old_loss - new_loss
+
+
+def train_with_restarts(
+    n_inputs: int,
+    layer_widths: list,
+    train_data: dict,
+    max_steps: int = 500,
+    n_restarts: int = 10,
+    verbose: bool = True,
+    pair_strategy: str = 'aggressive',   # pass‑through
+) -> BooleanNetwork:
+    """
+    Train multiple networks from different random seeds and keep the best.
+
+    Parameters
+    ----------
+    n_inputs, layer_widths : network architecture
+    train_data : training dict
+    max_steps : steps per training run
+    n_restarts : how many random initializations to try
+    verbose : print progress
+
+    Returns
+    -------
+    The BooleanNetwork with the lowest training loss found.
+    """
+    best_net = None
+    best_loss = float('inf')
+
+    for r in range(1, n_restarts + 1):
+        seed = random.randint(0, 2**31 - 1)
+        if verbose:
+            print(f"\n{'#'*64}")
+            print(f"  RESTART {r}/{n_restarts}  (seed={seed})")
+            print(f"{'#'*64}")
+
+        net = BooleanNetwork(n_inputs=n_inputs, layer_widths=layer_widths, seed=seed)
+        train(net, train_data, max_steps=max_steps, verbose=verbose, pair_strategy=pair_strategy)
+
+        loss = compute_loss(net, train_data)
+        if verbose:
+            print(f"  Restart {r} finished with loss {loss}/{len(train_data)}")
+
+        if loss < best_loss:
+            best_loss = loss
+            best_net = net
+            if loss == 0:
+                if verbose:
+                    print("  ✓ Perfect solution found, stopping restarts.")
+                break
+
+    return best_net
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -645,7 +921,13 @@ if __name__ == "__main__":
         print(f"  EXAMPLE: {desc}")
         print(f"{'#'*64}")
         train_data, test_data = make_dataset(n, fn, observed_fraction=frac)
-        net = BooleanNetwork(n_inputs=n, layer_widths=widths, seed=42)
-        train(net, train_data, max_steps=500, verbose=True)
+        net = train_with_restarts(
+            n_inputs=n,                # ← use the loop variable
+            layer_widths=widths,       # ← use the loop variable
+            train_data=train_data,
+            max_steps=500,
+            n_restarts=10,
+            verbose=True
+        )
         evaluate(net, train_data, test_data, verbose=True)
         input("\n  Press Enter for next example...")
