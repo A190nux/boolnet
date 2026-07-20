@@ -9,7 +9,7 @@ This project builds a **neural network entirely out of Boolean logic** — from 
 
 > *Can Boolean algebra be differentiated?*
 
-The answer is yes — not in the calculus sense, but through the **Boolean derivative**, a well-defined operator that tells you whether flipping a variable changes a function's output. From that single insight, we reconstructed the entire neural network training pipeline:
+The answer is yes — not in the calculus sense, but through the **Boolean derivative**, a well‑defined operator that tells you whether flipping a variable changes a function's output. From that single insight, we reconstructed the entire neural network training pipeline, culminating in a fully Boolean backpropagation algorithm.
 
 | Neural Network concept | Boolean equivalent we built |
 |---|---|
@@ -19,12 +19,13 @@ The answer is yes — not in the calculus sense, but through the **Boolean deriv
 | Dense layer (n → L) | AND-layer: weight matrix `W` of shape `(n × L)` |
 | Negative weights | Complement augmentation `[x, ¬x]` |
 | Gradient `∂L/∂w` | Boolean derivative `∂f/∂w ∈ {0, 1}` |
-| SGD weight update | Flip the best weight |
+| **Backpropagation** | **Single backward pass using Boolean chain rule** |
+| SGD weight update | Flip the best weight (or multiple at once) |
 | Hidden layers | Stack AND-layers |
 | Train/test split | Partial truth table observation |
 | Generalization | Accuracy on unseen input combinations |
 
-The result is a system that learns unknown Boolean functions from labeled examples, using the same conceptual loop as a real neural network: **forward pass → measure loss → compute derivatives → update parameters → repeat.**
+The result is a system that learns unknown Boolean functions from labeled examples, using the same conceptual loop as a real neural network: **forward pass → measure loss → compute derivatives via backprop → update parameters → repeat.**
 
 ---
 
@@ -44,17 +45,19 @@ For a Boolean function `f` and a variable `v`, the Boolean derivative at input `
 
 The result is `1` if flipping `v` changes the output of `f` at that input, and `0` if `v` is irrelevant there. This is a perfect analog of the gradient: it identifies which variables are *responsible* for the current output.
 
-### The backpropagation analogy
+### The Boolean Chain Rule
 
-If a Boolean function produces the wrong output, the Boolean derivative tells us which inputs, if flipped, would fix it — exactly like backpropagation in a neural network tells us which weights to adjust:
+While the raw Boolean derivative works for a single weight, a network with many layers needs to compute all derivatives efficiently. The key is the **Boolean chain rule**:
+
+If a signal flows from `x` through an intermediate `g` to final output `f`, then:
 
 ```
-Neural network backprop          Boolean derivative
-────────────────────────         ────────────────────────────────
-∂Loss/∂w  is large      →        ∂f/∂w = 1  (this weight matters here)
-∂Loss/∂w  is zero       →        ∂f/∂w = 0  (this weight is irrelevant here)
-Update: w -= lr × grad  →        Update: flip w (no learning rate needed)
+∂f/∂x  =  ∂f/∂g  AND  ∂g/∂x
 ```
+
+The logical AND replaces the multiplication of real gradients. In words: *the output flips when `x` flips iff flipping `x` flips `g` AND flipping `g` flips the output.*
+
+This chain rule lets us propagate sensitivity signals backward through the network in a single pass, exactly like standard backpropagation — but using pure logic instead of calculus.
 
 ---
 
@@ -263,35 +266,80 @@ return int(any(self.out_w[j] and h[j] for j in range(len(h))))
 
 ---
 
+### Step 7 — Fixing dead neurons (contradiction‑free initialization)
+
+**The problem:** Random initialization frequently produced neurons like `x₀ ∧ ¬x₀` — a logical contradiction that is always 0. These "dead neurons" waste capacity and produce zero gradient, analogous to the **dying ReLU** problem.
+
+**The fix:** For each neuron, we build its column by randomly choosing for every original signal `x_i` one of the three allowed (non-contradictory) patterns:
+
+- `(0,0)` — ignore `x_i`
+- `(1,0)` — require `x_i = 1`
+- `(0,1)` — require `x_i = 0`
+
+The only forbidden combination is `(1,1)`. This guarantees every neuron is satisfiable from the start, while maintaining a uniform distribution over all valid masks.
+
+---
+
+### Step 8 — Escaping local minima
+
+The greedy single‑flip training often got stuck in local minima where no one weight change reduces the loss. We introduced several mechanisms to escape:
+
+- **Pair‑flip search:** When stuck, try flipping two weights at once — two co‑dependent changes can open an escape route. A cheap candidate filter (only pairs that flip the output on a single error row) keeps it practical.
+- **Random perturbation:** If nothing helps, flip a small random set of safe weights (increasingly many after repeated failures) — analogous to simulated annealing.
+- **Random restarts:** Train multiple networks from different seeds and keep the best one — a common trick in non‑convex optimization.
+
+With these additions, the network reliably learned XOR, parity, and other previously unreachable functions.
+
+---
+
+### Step 9 — True Boolean backpropagation (the chain rule in action)
+
+The brute‑force derivative computation (evaluate each weight by two full forward passes) scaled as `O(W × N)`. We replaced it with a **single‑pass backward algorithm** that computes all `∂f/∂w` for an input `x` in time proportional to the network size.
+
+**How it works:**
+
+1. **Forward pass with caching** — stores every layer’s input and output.
+2. **Output sensitivity** — for the final OR gate, determine which last‑layer neurons, if toggled, would flip the answer.
+3. **Backward propagation through AND‑layers** — for a neuron `y = AND(req)`, the sensitivity to an input `x_i` is `1` iff all other required inputs are `1` (so `y` depends on `x_i`). The sensitivity to a weight `W[i]` is `1` iff all other required inputs are `1` and `x_i = 0` (so flipping the weight would change `y`).
+4. **Handling complement augmentation** — flipping a signal `h[p]` toggles both `x_in[p]` and `x_in[p+m]`. For each original signal we simulate this flip by re‑running only the downstream part of the network, which is cheap (linear in the remaining depth).
+5. **Aggregation** — accumulate the derivative signals for each weight across all misclassified rows, then flip the weight that fixes the most errors.
+
+This is a **pure Boolean backpropagation** — no floating‑point numbers, no gradient approximations, just logical AND and XOR. The training loop now uses this backprop to collect candidate flips much more efficiently than the old brute‑force scoring.
+
+---
+
 ## Current State of the Code
 
 ### Files
 
 | File | Description |
-|---|---|
-| `bool_net.py` | Full multi-layer Boolean neural network implementation |
-| `boolean_learner.py` | Earlier single-layer version with partial data support |
-| `boolean_learner.html` | Interactive visual demo of the single-layer learner |
+|------|-------------|
+| `bool_net.py` | Full multi‑layer Boolean neural network with backpropagation |
 
-### `bool_net.py` — Architecture
+### Architecture
 
 ```
 BooleanLayer
   W: list[list[int]]   shape (input_width × output_width)
   forward(x)           → AND-neuron evaluation
   flip(i, j)           → single weight update
+  _required_met(...)   → helper for local derivatives
+  weight_derivative_local(i,j,x) → ∂neuron_j/∂W[i][j]
+  input_derivative_local(i,j,x)  → ∂neuron_j/∂x_in[i]
 
 BooleanNetwork
   layers: list[BooleanLayer]
   out_w:  list[int]           output gate weights
   forward(x)                  → full forward pass
-  derivative_layer(x, k, i, j) → ∂f/∂W[k][i][j]
-  derivative_out(x, j)         → ∂f/∂out_w[j]
-  all_weight_ids()             → iterator over all learnable weights
-  flip_weight(wid)             → apply one update
+  forward_with_cache(x)       → output + intermediate values
+  backward(x)                 → dict {weight_id: derivative} for all weights
+  _output_sensitivity(h_last) → which last‑layer neurons affect the output
+  _backward_layer(...)        → backprop through one AND‑layer
+  _sens_through_augmentation(…) → backprop through complement augmentation
 
-train(net, train_data, ...)    → training loop
-evaluate(net, train_data, test_data, ...) → accuracy report
+train(net, train_data, ...)    → backprop‑based training with pair/perturbation fallbacks
+train_with_restarts(...)       → multiple seeds, keep best
+evaluate(...)                   → accuracy report
 make_dataset(n, fn, frac, ...) → train/test split
 ```
 
@@ -300,157 +348,81 @@ make_dataset(n, fn, frac, ...) → train/test split
 ```python
 from bool_net import *
 
-# Define your target function
 def my_fn(x):
     return x[0] ^ x[1]   # XOR
 
-# Split the truth table
 train_data, test_data = make_dataset(n=2, target_fn=my_fn, observed_fraction=0.75)
-
-# Build the network  (2 inputs, two hidden layers of width 4)
 net = BooleanNetwork(n_inputs=2, layer_widths=[4, 4], seed=42)
-
-# Train
 train(net, train_data, max_steps=500, verbose=True)
-
-# Evaluate
 evaluate(net, train_data, test_data, verbose=True)
 ```
 
 ---
 
-## Known Problems
+## Known Problems (Updated)
 
-### 1. Dead and contradictory neurons
+### 1. Dead and contradictory neurons ✅ Fixed
 
-The random initializer creates neurons like `x₀ ∧ ¬x₀` — a contradiction that is always `0` regardless of input. These are "dead neurons": they contribute nothing, waste capacity, and block the Boolean derivative from ever being `1` at their position.
+Random initialization no longer creates unsatisfiable neurons. Every neuron is guaranteed to have at least one satisfiable input pattern.
 
-In a real neural network this is called the **dying ReLU problem**: a neuron whose output is always `0` receives no gradient and never updates.
+### 2. Greedy search gets stuck ✅ Mitigated
 
-**Why it happens:** the random `{0,1}` initialization does not check for contradictions between a variable and its complement in the same column. When both `x₀` and `¬x₀` are required by the same neuron, the neuron can never fire.
+Pair‑flip search and random perturbations provide escape routes from local minima. Combined with random restarts, the optimizer now converges reliably on all tested benchmarks.
 
-**Fix:**  The weight matrix is now built column‑by‑column, enforcing
-that no neuron can ever require both a variable and its complement.
-Each original signal `x_i` is assigned one of three allowed patterns:
+### 3. XOR / parity failure ✅ Fixed
 
-- `(0,0)` — neuron ignores `x_i`
-- `(1,0)` — neuron requires `x_i = 1`
-- `(0,1)` — neuron requires `x_i = 0`
+With the fixes above plus true backpropagation, the network consistently learns XOR (n=2) and parity (n=3) in two‑layer configurations.
 
-This guarantees every neuron is satisfiable from the start.
-The initialization runs in linear time and produces a uniform
-distribution over all valid masks.
+### 4. Single output only 🔧 Planned
 
-**Status:** Fixed.
+The current network predicts a single Boolean value. Multi‑class / multi‑label output requires extending the output layer to a vector of OR gates.
 
----
+### 5. No regularization 🔧 Planned
 
-### 2. Greedy search gets stuck
-
-The training loop picks the single best weight flip at each step (the highest-scoring candidate by global error reduction). When no single flip improves the total training loss, it stops — even if two co-dependent flips together would make progress.
-
-This is the **saddle point / local minimum problem** from neural network optimization. Greedy coordinate descent (one weight at a time) is the Boolean equivalent of SGD with very small batch size and no momentum — it gets trapped.
-
-**Status:** Known, not yet fixed.
-
----
-
-### 3. XOR still fails at 2 layers
-
-The architecture is theoretically capable of representing XOR — a 2-layer Boolean circuit can express any Boolean function. But in practice, the combination of dead neurons and greedy search prevents convergence for XOR with the current implementation.
-
-This is analogous to a 2-layer neural network that provably can learn XOR, but failing in practice due to poor initialization and optimizer choice.
-
-**Status:** Known, blocked by problems 1 and 2.
-
----
-
-### 4. Single output only
-
-The current network produces exactly one output bit. Real classification problems often need multiple outputs (multi-class classification) or a richer final layer.
-
-**Status:** Not yet designed or implemented.
-
----
-
-### 5. No regularization
-
-With partial data, the network overfits to the training rows. It has no mechanism to prefer simpler functions (fewer active terms) over complex ones when both fit the training data equally well.
-
-In real neural networks this is addressed with L1/L2 weight regularization, dropout, or early stopping. Boolean equivalents exist but are not implemented.
-
-**Status:** Not yet designed or implemented.
+The network can overfit on small training sets. Boolean L1/L2 regularization (preferring simpler functions) and early stopping are on the roadmap.
 
 ---
 
 ## Future Plans and Ideas
 
-### Immediate fixes (next steps)
+### Immediate next steps
 
-#### Fix 1: Smarter initialization
-Before a layer is initialized, check every column for contradictions — if both `xᵢ` and `¬xᵢ` appear in the same AND-mask, the neuron is dead by construction. The fix is to ensure no column contains a variable and its complement simultaneously.
+#### Multiple outputs
+Extend the final layer from a single OR gate to a vector of OR gates — one per output class. This would allow multi‑label Boolean classification.
 
-```python
-# Pseudocode for contradiction-free initialization
-for each neuron j:
-    for each original input i:
-        if W[i][j] == 1:
-            W[i + n][j] = 0   # force ¬xᵢ to be excluded
-```
-
-This directly solves the dead neuron problem and is the Boolean equivalent of careful weight initialization (Xavier/He initialization in real networks).
-
-#### Fix 2: Multi-flip search / restarts
-When the greedy search gets stuck (no single flip helps), instead of stopping:
-1. Try all **pairs** of flips (two co-dependent changes)
-2. Or: randomly reinitialize the worst-performing neurons and retry
-3. Or: implement a simple **random restart** — re-initialize the whole network with a different seed and keep the best result
-
-This is analogous to SGD with momentum, Adam optimizer, or random restarts in neural network training.
-
----
-
-### Medium-term: multiple outputs
-
-Extend the final layer from a single OR gate to a vector of OR gates — one per output class. This would allow the network to solve multi-label or multi-class problems:
-
-```
-Layer k output  →  [out_w₀, out_w₁, ..., out_wₘ]  →  [f₀, f₁, ..., fₘ]
-```
-
-Each `fᵢ` is one output bit, trained independently with its own loss. This makes the architecture functionally equivalent to a multi-output neural network classifier.
-
----
-
-### Medium-term: Boolean regularization
-
-To combat overfitting on partial data, add a preference for **sparser functions** — fewer active weights. The Boolean equivalent of L1 regularization:
+#### Boolean regularization
+Add a preference for sparser functions — fewer active weights. The Boolean equivalent of L1 regularization:
 
 ```
 Loss = training_errors + λ × (number of active weights)
 ```
 
-During training, when two candidate flips fix the same number of errors, prefer the one that results in fewer total active weights. This biases the learner toward simpler hypotheses — the Boolean version of Occam's razor, and the mechanism behind good generalization.
+When two candidate flips fix the same number of errors, prefer the one that results in fewer total active weights — the Boolean Occam's razor.
+
+#### Simultaneous weight updates (batch flips)
+With backprop we can compute which weights matter for each error row. Aggregating over a minibatch allows us to flip **all** weights that help, not just the single best — akin to full gradient descent.
 
 ---
 
-### Long-term: proper backpropagation through layers
+### Medium‑term
 
-The current derivative computation re-evaluates the entire network twice per weight (one forward pass with the weight at 0, one with it at 1). For a network with `W` total weights and `N` training rows, this is `O(W × N)` forward passes per training step — expensive for large networks.
+#### Stochastic minibatch training
+Use random subsets of error rows to compute derivative counts, improving scalability to larger datasets.
 
-In a real neural network, backpropagation computes all gradients in a single backward pass using the chain rule, making it `O(W + N)`. A Boolean analog is possible using **Boolean chain rule / influence propagation**:
-
-```
-∂f/∂W[0][i][j]  =  (∂f/∂h₀[j])  AND  (∂h₀[j]/∂W[0][i][j])
-```
-
-Where `∂f/∂h₀[j]` is the sensitivity of the output to neuron `j`'s value, and can be computed in one backward sweep. This would make training scale to deeper, wider networks.
+#### Scaling with NumPy / C++ / GPU
+Move the core forward and backward operations to array‑based or compiled code for larger input sizes and deeper networks. The Boolean operations are highly amenable to bit‑wise vectorisation.
 
 ---
 
-### Long-term: stochastic training
+### Long‑term
 
-Currently the learner picks the *first* error row and uses it to compute derivatives. A natural extension: pick a **random batch** of error rows, compute derivatives on each, and aggregate — choosing the flip that most consistently has a non-zero derivative across the batch. This is the Boolean analog of **mini-batch SGD** and would reduce the variance of the update signal.
+#### Theoretical analysis and comparisons
+- Relate the training dynamics to PAC learning bounds and Boolean circuit complexity.
+- Compare empirically with the recently published Boolean variation‑based backprop (XNOR‑gate neurons) to highlight the unique properties of the AND‑mask architecture.
+
+#### Deeper optimization strategies
+- Explore hybrid methods that combine the current greedy global‑scoring with pure backprop‑style simultaneous flips.
+- Investigate whether a SAT solver can serve as a fallback when the learner gets stuck on hard functions.
 
 ---
 
@@ -458,15 +430,15 @@ Currently the learner picks the *first* error row and uses it to compute derivat
 
 This project independently reconstructed ideas from several established fields. Exploring these connections could be fruitful:
 
-- **Binary Neural Networks (BNNs)**: Real research area (XNOR-Net, BinaryConnect) that trains neural networks with binary weights using real-valued gradients as a proxy. Our approach is fully Boolean throughout — no real-valued gradient proxy.
+- **Binary Neural Networks (BNNs):** Real research area (XNOR-Net, BinaryConnect) that trains neural networks with binary weights using real-valued gradients as a proxy. Our approach is fully Boolean throughout — no real-valued gradient proxy.
 
-- **Boolean circuit complexity**: The theoretical study of how many gates are needed to compute functions. Our layer width `L` directly maps to circuit width. Known results (e.g., XOR requiring depth 2) directly predict our network's failures and successes.
+- **Boolean circuit complexity:** The theoretical study of how many gates are needed to compute functions. Our layer width `L` directly maps to circuit width. Known results (e.g., XOR requiring depth 2) directly predict our network's failures and successes.
 
-- **Quine-McCluskey algorithm**: A classical method for minimizing Boolean expressions (finding the simplest SOP representation). This is the "ideal" version of what our learner is trying to do — exploring the connection could yield a smarter search strategy.
+- **Quine-McCluskey algorithm:** A classical method for minimizing Boolean expressions (finding the simplest SOP representation). This is the "ideal" version of what our learner is trying to do — exploring the connection could yield a smarter search strategy.
 
-- **Satisfiability (SAT) solvers**: When the learner gets stuck, the problem of finding a weight configuration that achieves zero training loss is equivalent to a SAT problem. A SAT solver could be used as a fallback when greedy search fails.
+- **Satisfiability (SAT) solvers:** When the learner gets stuck, the problem of finding a weight configuration that achieves zero training loss is equivalent to a SAT problem. A SAT solver could be used as a fallback when greedy search fails.
 
-- **Probably Approximately Correct (PAC) learning**: A formal framework for analyzing how many training examples are needed to learn a Boolean function with high probability. The theoretical guarantees of PAC learning would directly tell us how much data we need for our learner to generalize.
+- **Probably Approximately Correct (PAC) learning:** A formal framework for analyzing how many training examples are needed to learn a Boolean function with high probability. The theoretical guarantees of PAC learning would directly tell us how much data we need for our learner to generalize.
 
 ---
 
@@ -488,17 +460,18 @@ Architecture
 Training
   Forward pass                      Same — evaluate f on training rows
   Loss (MSE, cross-entropy)         Hamming distance (# of wrong rows)
+  Backpropagation                   Boolean chain rule (AND of sensitivities)
   Gradient ∂L/∂w                    Boolean derivative ∂f/∂w ∈ {0, 1}
   Gradient = 0 → weight irrelevant  Derivative = 0 → weight irrelevant here
   SGD: w -= lr × gradient           Flip: w ^= 1 (no learning rate)
-  Mini-batch                        Subset of error rows (not yet implemented)
-  Epochs                            Steps (one weight flip per step)
+  Mini-batch                        Subset of error rows (aggregate counts)
+  Momentum / Adam                   Pair‑flip search, random perturbations
 
 Failure modes
-  Dying ReLU                        Dead neuron (x ∧ ¬x contradiction)
-  Local minimum / saddle point      Greedy search stuck (no flip helps)
+  Dying ReLU                        Dead neuron (x ∧ ¬x) — fixed by init
+  Local minimum / saddle point      Escaped via pair flips & restarts
   XOR fails on 1 layer              Same — proven impossible
-  Overfitting                       Same — memorizes training rows
+  Overfitting                       Same — regularization planned
 
 Generalization
   Train/test split                  Partial truth table observation
@@ -506,4 +479,4 @@ Generalization
   Early stopping                    Stop when test loss stops improving
 ```
 
-The differences are in the *mechanics*, not the *concepts*. A Boolean network is a neural network with the real number line collapsed to two points.
+The differences are in the *mechanics*, not the *concepts*. A Boolean network is a neural network with the real number line collapsed to two points — and now it even has its own native backpropagation.
