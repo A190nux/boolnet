@@ -394,6 +394,26 @@ def _score_pair_flip(net, data, wid_a, wid_b):
     return old - new
 
 
+def _score_flip(net, data, wid):
+    """
+    True effect of flipping a single weight on total training loss.
+
+    NOTE: this is deliberately NOT the same thing as "how many error rows
+    have derivative=1 for this weight". A weight's Boolean derivative being 1
+    on an error row only tells you the output *would* flip on that row in
+    isolation — it says nothing about whether the same flip also flips the
+    output on rows that were already correct. Scoring by vote count alone
+    can pick a flip that fixes k error rows while breaking k+1 correct ones,
+    a net loss increase disguised as a "positive" move. Scoring by actual
+    loss delta (as we already do for pair flips) avoids that.
+    """
+    old = compute_loss(net, data)
+    net.flip_weight(wid)
+    new = compute_loss(net, data)
+    net.flip_weight(wid)
+    return old - new
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Training loop using backpropagation
 # ─────────────────────────────────────────────────────────────────────────────
@@ -409,10 +429,16 @@ def train(
 
     1. Identify misclassified rows.
     2. For each error row, run net.backward(x) to get the set of weights
-       whose flip would change the output for that row.
-    3. Count how many error rows each weight would fix.
-    4. Flip the weight with the highest count (if > 0).
-    5. If no single flip helps, try a pair‑flip search among active weights.
+       whose flip would change the output for that row — this is only a
+       CANDIDATE filter (weights with no effect on any error row can't help).
+    3. Score every candidate by its true effect on total training loss
+       (flip → compute_loss → unflip), exactly like the pair‑flip search
+       already does. A weight that flips several error rows to correct can
+       simultaneously flip other, previously‑correct rows to wrong — vote
+       counting alone can't see that, so we check real loss instead.
+    4. Flip the candidate with the best (most negative) loss delta, if any
+       candidate actually reduces loss.
+    5. If no single flip helps, try a pair‑flip search among candidates.
     6. If still stuck, apply a small random perturbation.
     """
     MAX_STUCK = 5
@@ -441,36 +467,34 @@ def train(
         error_rows = [x for x, y in train_data.items() if net(x) != y]
 
         # ── 1. Single‑flip candidates via backprop ─────────────────
-        weight_votes = {}          # wid -> number of error rows where derivative=1
+        # Backprop gives us a cheap CANDIDATE filter: only weights with
+        # derivative=1 on at least one error row can possibly help.
+        candidate_wids = set()
         for x in error_rows:
             derivs = net.backward(x)
             for wid, d in derivs.items():
                 if d == 1:
-                    weight_votes[wid] = weight_votes.get(wid, 0) + 1
+                    candidate_wids.add(wid)
 
-        if weight_votes:
-            best_wid = max(weight_votes, key=weight_votes.get)
-            best_score = weight_votes[best_wid]
-            if best_score > 0:
-                net.flip_weight(best_wid)
-                if verbose:
-                    _log_flip(net, best_wid, best_score)
-                stuck_counter = 0
-                continue
+        best_wid, best_score = None, 0
+        for wid in candidate_wids:
+            score = _score_flip(net, train_data, wid)   # true loss delta
+            if score > best_score:
+                best_score = score
+                best_wid = wid
+
+        if best_wid is not None:
+            net.flip_weight(best_wid)
+            if verbose:
+                _log_flip(net, best_wid, best_score)
+            stuck_counter = 0
+            continue
 
         # ── 2. No single flip helped — try pair flips ──────────────
         if verbose:
             print("         No beneficial single flip — searching pairs...")
 
-        # Find active weights (those with derivative=1 on any error row)
-        active_wids = set()
-        for x in error_rows:
-            derivs = net.backward(x)
-            for wid, d in derivs.items():
-                if d == 1:
-                    active_wids.add(wid)
-        if not active_wids:
-            active_wids = set(all_wids)   # fallback to all weights
+        active_wids = candidate_wids if candidate_wids else set(all_wids)
 
         active_list = list(active_wids)
         pair_success = False

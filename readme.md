@@ -288,23 +288,80 @@ The greedy single‑flip training often got stuck in local minima where no one w
 - **Random perturbation:** If nothing helps, flip a small random set of safe weights (increasingly many after repeated failures) — analogous to simulated annealing.
 - **Random restarts:** Train multiple networks from different seeds and keep the best one — a common trick in non‑convex optimization.
 
-With these additions, the network reliably learned XOR, parity, and other previously unreachable functions.
+With these additions, the network reliably learned XOR and other previously unreachable functions — though parity turned out to need one more fix before "reliably" was actually true. See Step 10.
 
 ---
 
 ### Step 9 — True Boolean backpropagation (the chain rule in action)
 
-The brute‑force derivative computation (evaluate each weight by two full forward passes) scaled as `O(W × N)`. We replaced it with a **single‑pass backward algorithm** that computes all `∂f/∂w` for an input `x` in time proportional to the network size.
+The brute‑force derivative computation (evaluate each weight by two full forward passes) scaled as `O(W × N)`. We replaced it with a **backward algorithm** that computes all `∂f/∂w` for an input `x` without needing a separate forward pass per weight (see item 4 below for the actual scaling — it's cheaper than brute force, but not quite the strict linear‑in‑network‑size single pass a real backprop achieves).
 
 **How it works:**
 
 1. **Forward pass with caching** — stores every layer’s input and output.
 2. **Output sensitivity** — for the final OR gate, determine which last‑layer neurons, if toggled, would flip the answer.
 3. **Backward propagation through AND‑layers** — for a neuron `y = AND(req)`, the sensitivity to an input `x_i` is `1` iff all other required inputs are `1` (so `y` depends on `x_i`). The sensitivity to a weight `W[i]` is `1` iff all other required inputs are `1` and `x_i = 0` (so flipping the weight would change `y`).
-4. **Handling complement augmentation** — flipping a signal `h[p]` toggles both `x_in[p]` and `x_in[p+m]`. For each original signal we simulate this flip by re‑running only the downstream part of the network, which is cheap (linear in the remaining depth).
-5. **Aggregation** — accumulate the derivative signals for each weight across all misclassified rows, then flip the weight that fixes the most errors.
+4. **Handling complement augmentation** — flipping a signal `h[p]` toggles both `x_in[p]` and `x_in[p+m]`. For each original signal we simulate this flip by re‑running only the downstream part of the network — this is *not* strictly a single pass (it's roughly `O(depth)` re‑simulations per layer, so total cost is closer to `O(depth² × L²)` than the `O(depth × L²)` of an ideal backward pass), but it is exact and still much cheaper than the original brute‑force scoring.
+5. **Candidate filtering** — `backward(x)` on a misclassified row tells us which weights have derivative `1`, i.e. which weights *could possibly* fix that row in isolation. This is only ever used as a cheap filter to narrow down candidates — see Step 10 for why treating it as anything more than a filter (e.g. "the weight with the most votes across error rows") is a bug.
 
-This is a **pure Boolean backpropagation** — no floating‑point numbers, no gradient approximations, just logical AND and XOR. The training loop now uses this backprop to collect candidate flips much more efficiently than the old brute‑force scoring.
+This is a **pure Boolean backpropagation** — no floating‑point numbers, no gradient approximations, just logical AND and XOR. The training loop uses this backprop to narrow down candidate flips instead of brute‑force scoring every weight in the network.
+
+---
+
+### Step 10 — A scoring bug that masqueraded as convergence
+
+Step 9 gave us `backward(x)`, which is exact — verified against brute force (flip a weight, run `forward()`, compare) across networks up to 3 hidden layers deep, 0 mismatches out of 60,000+ checks. The bug wasn't in the derivative math. It was in how the training loop *used* the derivatives.
+
+**The original selection rule:** for every misclassified row, collect the weights with derivative `1` (via `backward()`), and tally *votes* — how many error rows each weight would fix. Flip whichever weight has the most votes.
+
+**Why that's wrong:** a weight's derivative being `1` on an error row only says the output *would* flip on that row, in isolation. It says nothing about what the same flip does to rows that were already correct. A flip with 3 votes on error rows can simultaneously break 4 previously‑correct rows — a net loss *increase* that the vote count reports as a "good" move.
+
+**What this caused in practice:** an infinite 2‑cycle. One run (parity, `n=3`, layers `[6,4]`) got trapped flipping the exact same weight back and forth forever:
+
+```
+Step 25 | Loss 4 → flip layer(1,1,1), "fixes 3 errors" → actually breaks 2 correct rows → Loss 3
+Step 26 | Loss 3 → flip layer(1,1,1) back, "fixes 2 errors" → actually breaks 3 correct rows → Loss 4
+Step 27 | Loss 4 → same flip as step 25 → Loss 3
+  ... repeats indefinitely
+```
+
+Worse: because the vote‑counting rule always found a "positive" flip in this cycle, `stuck_counter` reset to `0` every step. The pair‑flip / perturbation / restart mechanisms from Step 8 are correctly implemented and do score by true loss — but they never got triggered here, because the loop never registered as "stuck." The escape hatches worked; they just never opened.
+
+This directly undercut the "✅ Fixed" claim this document previously made about XOR/parity. Concretely, running the documented setup (`train_with_restarts`, 10 restarts × 500 steps) on parity (`n=3`, `[6,4]`) across 10 random seeds:
+
+```
+Before fix:  2/10 seeds converged to zero training loss
+```
+
+Not "consistently learns," despite the claim.
+
+**The fix:** keep `backward()`'s output as a cheap *candidate filter* (Step 9, item 5), but score each candidate by its actual effect on total training loss — flip, `compute_loss()`, unflip — exactly the same principle the pair‑flip search (Step 8) already used correctly:
+
+```python
+def _score_flip(net, data, wid):
+    old = compute_loss(net, data)
+    net.flip_weight(wid)
+    new = compute_loss(net, data)
+    net.flip_weight(wid)
+    return old - new   # positive = flipping this weight actually reduces loss
+```
+
+The single‑flip step now flips the candidate with the best score, only if that score is positive.
+
+**Verification after the fix**, 20 fresh random seeds per function, same `train_with_restarts` settings:
+
+```
+Function                    Before      After
+──────────────────────────────────────────────
+Parity (n=3), layers [6,4]   2/10       20/20
+Parity (n=3), layers [4]      —         20/20   (was silently stuck at 62% train acc)
+XOR (n=2),   layers [4,4]   10/10       20/20
+Majority (n=3), [4,4]         —         20/20
+```
+
+Training also got *faster* in wall‑clock time on the standard benchmarks (e.g. parity `[6,4]`: 4.08s → 0.34s) despite each step now doing more work per candidate — because no steps are wasted looping in a cycle anymore.
+
+**One side effect worth noting:** now that training actually reaches zero loss reliably, overfitting on small held‑out splits is more visible, not less. Majority (`n=5`, 75/25 split) went from 100% train / 50% test to 100% train / 12.5% test — the model has more room to memorize now that it isn't stuck. This is expected given Known Problem #5 below (no regularization yet), not a new issue.
 
 ---
 
@@ -337,7 +394,9 @@ BooleanNetwork
   _backward_layer(...)        → backprop through one AND‑layer
   _sens_through_augmentation(…) → backprop through complement augmentation
 
-train(net, train_data, ...)    → backprop‑based training with pair/perturbation fallbacks
+_score_flip(net, data, wid)    → true loss delta from a single candidate flip
+_score_pair_flip(net, data, a, b) → true loss delta from a candidate pair flip
+train(net, train_data, ...)    → backprop‑filtered candidates, scored by true loss, with pair/perturbation fallbacks
 train_with_restarts(...)       → multiple seeds, keep best
 evaluate(...)                   → accuracy report
 make_dataset(n, fn, frac, ...) → train/test split
@@ -365,13 +424,13 @@ evaluate(net, train_data, test_data, verbose=True)
 
 Random initialization no longer creates unsatisfiable neurons. Every neuron is guaranteed to have at least one satisfiable input pattern.
 
-### 2. Greedy search gets stuck ✅ Mitigated
+### 2. Greedy search gets stuck ✅ Fixed
 
-Pair‑flip search and random perturbations provide escape routes from local minima. Combined with random restarts, the optimizer now converges reliably on all tested benchmarks.
+Pair‑flip search and random perturbations provide escape routes from local minima, combined with random restarts. These were implemented correctly from the start, but a separate bug in the single‑flip selection rule (see Step 10) could mask the "stuck" state with an infinite oscillation, so the escape routes never got invoked when it mattered most. Fixed in Step 10 by scoring single flips the same way pair flips already were: by true effect on total loss, not by an error‑row vote count.
 
-### 3. XOR / parity failure ✅ Fixed
+### 3. XOR / parity failure ✅ Fixed, verified
 
-With the fixes above plus true backpropagation, the network consistently learns XOR (n=2) and parity (n=3) in two‑layer configurations.
+The network learns XOR (n=2) and parity (n=3) in two‑layer configurations. This is now backed by actual numbers, not just an architecture argument: 20/20 random seeds converge to zero training loss on the documented benchmark settings (see Step 10). Before the Step 10 fix, this same claim was checked and found to only hold 2/10 times for parity — worth remembering as a reminder to verify "should work" claims empirically, not just architecturally.
 
 ### 4. Single output only 🔧 Planned
 
