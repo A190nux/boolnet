@@ -115,6 +115,14 @@ class BooleanLayer:
         """
         ∂(neuron_j) / ∂x_in[i]  for input x_in.
         Returns 1 if flipping x_in[i] alone would change neuron j's output.
+
+        This is correct for a single neuron j in isolation. It is not
+        currently called anywhere in the backward pass: combining these
+        per-neuron results across the several neurons that can share an
+        input wire needs more care than a simple combination rule (see
+        _backward_layer's docstring for why). Kept as a building block for
+        anyone extending the backward pass to reconvergent-fanout-aware
+        sensitivity propagation.
         """
         if self.W[i][j] == 0:
             return 0
@@ -209,15 +217,30 @@ class BooleanNetwork:
                     sens[j] = 1
         return sens
 
-    def _backward_layer(self, k: int, aug_input: tuple, raw_output: tuple,
-                        sens_out: list):
+    def _backward_layer(self, k: int, aug_input: tuple, sens_out: list):
         """
         Backpropagate through layer k.
 
         Returns:
             weight_derivs : dict {(i,j): 1} for weights with derivative 1
-            sens_in       : list of length len(aug_input), sensitivity of
-                            final output w.r.t. each input wire.
+
+        NOTE: an earlier version of this function also returned sens_in,
+        a per-input-wire sensitivity built by OR-combining
+        input_derivative_local(i, j, ...) across every neuron j in the
+        layer. That combination rule is only valid when input wire i
+        feeds a single downstream neuron. When one wire fans out to
+        several neurons whose outputs later interact (e.g. get XORed
+        together further downstream), OR-combining their individual
+        single-flip sensitivities can give the wrong answer — flipping
+        the wire can leave the true final output unchanged even though
+        each path looks sensitive in isolation (the same reconvergent-
+        fanout issue classical circuit-sensitivity analysis has to deal
+        with). That sens_in was never actually consumed by the caller
+        (_sens_through_augmentation recomputes sensitivity by direct
+        resimulation instead, which is exact), so it was dead code that
+        happened not to cause a bug — but it was one accidental call
+        site away from becoming one. It's been removed rather than kept
+        around unused. See the readme for the full writeup.
         """
         layer = self.layers[k]
         L = layer.output_width
@@ -229,31 +252,28 @@ class BooleanNetwork:
                 if sens_out[j] and layer.weight_derivative_local(i, j, aug_input):
                     weight_derivs[(i, j)] = 1
 
-        sens_in = [0] * input_width
-        for i in range(input_width):
-            for j in range(L):
-                if sens_out[j] and layer.input_derivative_local(i, j, aug_input):
-                    sens_in[i] = 1
-                    break
-        return weight_derivs, sens_in
+        return weight_derivs
 
-    def _sens_through_augmentation(self, k: int, sens_in: list,
-                                   aug_input: tuple, raw_output: tuple,
-                                   final_out: int, cache: dict) -> list:
+    def _sens_through_augmentation(self, k: int, aug_input: tuple,
+                                   final_out: int) -> list:
         """
         Convert sensitivity w.r.t. the augmented input of layer k into
         sensitivity w.r.t. the raw output of layer k‑1.
 
         For each original signal p in the previous layer, we simulate
         flipping it (which toggles both x_in[p] and x_in[p+m]) and see if
-        the final output changes.
+        the final output changes. This is a genuine resimulation — we
+        deliberately do NOT try to reuse or combine cached per-neuron
+        sensitivities from downstream layers here, because doing so would
+        reintroduce the reconvergent-fanout problem described in
+        _backward_layer's docstring. Resimulating directly costs more
+        (this is the main reason the full backward pass is closer to
+        O(depth^2) than the O(depth) of a real backprop pass — see the
+        readme), but it's exact.
         """
         m_prev = self.layer_widths[k-1]
         sens_prev = [0] * m_prev
 
-        # Use the cached forward values to avoid recomputing from scratch
-        # For each p, we modify the augmented input to layer k and
-        # re‑run from layer k onward.
         for p in range(m_prev):
             # Build modified augmented input for layer k
             mod_aug = list(aug_input)
@@ -292,18 +312,14 @@ class BooleanNetwork:
         # Process layers from last down to first
         for k in reversed(range(len(self.layers))):
             aug_input = cache['aug_inputs'][k]
-            raw_output = cache['raw_outputs'][k]
 
-            w_derivs, sens_in = self._backward_layer(k, aug_input, raw_output, sens_out)
+            w_derivs = self._backward_layer(k, aug_input, sens_out)
             for (i, j), d in w_derivs.items():
                 all_derivs[('layer', k, i, j)] = d
 
             # If not the first layer, compute sensitivity for previous layer
             if k > 0:
-                sens_out = self._sens_through_augmentation(
-                    k, sens_in, aug_input, raw_output, final_out, cache)
-            # For the first layer (k=0), sens_in gives sensitivity to original inputs,
-            # but we don't need it for weight updates.
+                sens_out = self._sens_through_augmentation(k, aug_input, final_out)
 
         # Output gate derivatives
         for j in range(len(self.out_w)):

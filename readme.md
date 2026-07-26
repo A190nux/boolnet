@@ -365,6 +365,41 @@ Training also got *faster* in wall‑clock time on the standard benchmarks (e.g.
 
 ---
 
+### Step 11 — Removing dead, misleading sensitivity code
+
+Step 10 fixed the scoring bug but left something noted as a loose end: `_backward_layer` computed a `sens_in` value by OR‑combining `input_derivative_local(i, j, ...)` across every neuron `j` sharing input wire `i`. That combination rule is only valid when wire `i` feeds a single downstream neuron. When one wire fans out to several neurons whose outputs later interact — e.g. get XORed together further downstream — OR‑combining their individual single‑flip sensitivities can give the wrong answer: flipping the wire can leave the true final output unchanged even though each path looks sensitive in isolation. (This is the same *reconvergent fanout* problem classical digital‑circuit sensitivity analysis has always had to deal with — see the comparison section below.)
+
+The reason this never caused a visible bug: `sens_in` was computed and passed to `_sens_through_augmentation`, which never actually read it — that function recomputes sensitivity by direct resimulation instead, which sidesteps the problem entirely by being exact rather than compositional. So the invalid computation was dead code. It just happened to be dead code sitting one accidental refactor away from becoming a real bug, and the comment on `_sens_through_augmentation` claimed it "uses cached forward values to avoid recomputing from scratch," which was also inaccurate — it does the opposite, and that's the correct choice, just misdescribed.
+
+**The fix:** removed the `sens_in` computation from `_backward_layer` entirely (it returns just `weight_derivs` now), dropped the now‑unused `raw_output` and `cache` parameters that had been threaded through `_backward_layer` and `_sens_through_augmentation` without ever being read, and rewrote the comments to accurately describe what the resimulation step does and why. `input_derivative_local` (the correct, single‑neuron‑local primitive itself) is kept as a building block, now documented as currently unused rather than silently orphaned.
+
+Re‑ran both verification suites after the change: the brute‑force weight‑derivative check (0/60,000+ mismatches, unchanged) and the 20‑seed convergence stress test (20/20 across parity, XOR, majority, unchanged). Pure cleanup, no behavior change — the value of doing it is in preventing a future bug, not fixing a present one.
+
+---
+
+## How This Compares to Standard (Real‑Valued) Backprop
+
+**Why real backprop is a single, cheap pass.** Differentiation is linear: the multivariate chain rule says a total derivative is a *sum* of path contributions. That linearity is what lets standard backprop cache one local Jacobian per layer during the forward pass, then compose them backward with a single matrix multiply per layer — never touching the raw data again. Cost stays proportional to network size, `O(depth × width²)`, same order as the forward pass.
+
+**Why this Boolean version can't do the same trick everywhere.** The Boolean derivative `∂f/∂v = f(v=0) XOR f(v=1)` is a finite difference over a discrete domain, not a linearization, and it does not have an equivalent sum rule. Concretely: if a signal `x` fans out to two neurons `h1` and `h2` that later get XORed together downstream, flipping `x` can leave the final output completely unchanged even though each path, considered alone, looks sensitive. Naively OR‑combining independent path sensitivities gets this wrong. This is exactly the **reconvergent fanout** problem from digital circuit testing — the same reason path‑tracing test‑generation algorithms (e.g. PODEM, the D‑algorithm) can't treat fan‑out paths independently, and no coincidence that the term "Boolean difference" for this exact derivative operator originates in that literature (Sellers, Hsiao & Bearnson, 1968).
+
+Within a single AND‑layer, where each weight belongs to exactly one neuron, no such fan‑out ambiguity exists, so the local chain rule (`sens_out[j] AND local_derivative`) is exact — verified against brute force across networks up to 3 hidden layers deep, 0 mismatches out of 60,000+ checks. But once a neuron's *output* fans out to multiple neurons in the next layer, the shortcut breaks, so `_sens_through_augmentation` deliberately falls back to direct resimulation (flip the neuron, re‑run the forward pass through everything downstream) rather than trying to compose cached sensitivities. Exact, but not free.
+
+**Scaling comparison:**
+
+| | Standard backprop | This implementation |
+|---|---|---|
+| Cost per backward pass | `O(depth × width²)` | `O(depth² × width³)` — resimulation compounds with depth |
+| Why | Cached local Jacobian, composed once per layer | Each earlier layer needs a growing resimulation through everything downstream |
+| vs. naive brute force (`O(depth² × width⁴)`, evaluate every weight by two full forward passes) | n/a | Still a real win — saves roughly a factor of `width` |
+
+Three more scaling dimensions worth separating out:
+- **Parameter count** scales well — `O(depth × width²)`, linear in the number of inputs `n` (the whole point of the Step 4 redesign away from enumerated SOP terms).
+- **Training‑loop cost per step** got *more* expensive per candidate after the Step 10 fix, since scoring now runs `compute_loss` over the full dataset for every candidate weight rather than trusting a vote count — in practice a net win in wall‑clock time (far fewer wasted steps), but cost now also scales with dataset size, not just network size.
+- **Constant factors** dominate in practice right now — everything is plain Python loops over lists/tuples, no vectorization. The current demo scale (`n ≤ 5`, widths `≤ 8`, depth `≤ 3`) is comfortably fast; an order of magnitude past that, Python‑loop overhead bites before the algorithmic complexity does.
+
+---
+
 ## Current State of the Code
 
 ### Files
@@ -444,13 +479,19 @@ The network can overfit on small training sets. Boolean L1/L2 regularization (pr
 
 ## Future Plans and Ideas
 
-### Immediate next steps
+Roughly in priority order — highest expected value for lowest conceptual risk first.
 
-#### Multiple outputs
-Extend the final layer from a single OR gate to a vector of OR gates — one per output class. This would allow multi‑label Boolean classification.
+### 1. Bit‑pack the dataset dimension
 
-#### Boolean regularization
-Add a preference for sparser functions — fewer active weights. The Boolean equivalent of L1 regularization:
+The one idea here that's specific to Boolean networks in a way real backprop can't exploit: represent each neuron's output *across the entire training set* as a single integer bitmask (or a NumPy bit array), and turn `forward()` for a whole layer into a handful of bitwise AND/OR/XOR operations over those masks instead of a Python loop over rows. This doesn't fix the `O(depth²)` resimulation cost from the comparison section above, but it collapses the dataset‑size dimension out of the complexity almost entirely — probably the biggest win for the least risk, and a natural fit for the "Scaling with NumPy" idea already below, made concrete.
+
+### 2. Cone‑of‑influence pruning
+
+`_sens_through_augmentation` currently resimulates through *every* downstream neuron regardless of whether it actually depends on the flipped signal. Many won't — their AND‑mask never touches that wire or its complement. Skipping neurons outside the cone of influence shrinks the constant factor without changing the algorithm's structure.
+
+### 3. Boolean regularization
+
+Now more urgent than when this was first listed: now that training reliably reaches zero loss (Step 10), overfitting shows up unmasked instead of being hidden behind convergence failures. Concretely observed: Majority (`n=5`, 75/25 split) went from 100% train / 50% test *before* the Step 10 fix to 100% train / 12.5% test *after* — the model has more room to memorize now that it isn't stuck. The plan is unchanged, just more urgent:
 
 ```
 Loss = training_errors + λ × (number of active weights)
@@ -458,36 +499,34 @@ Loss = training_errors + λ × (number of active weights)
 
 When two candidate flips fix the same number of errors, prefer the one that results in fewer total active weights — the Boolean Occam's razor.
 
-#### Simultaneous weight updates (batch flips)
-With backprop we can compute which weights matter for each error row. Aggregating over a minibatch allows us to flip **all** weights that help, not just the single best — akin to full gradient descent.
+### 4. Multiple outputs
 
----
+Extend the final layer from a single OR gate to a vector of OR gates — one per output class, for multi‑label Boolean classification.
 
-### Medium‑term
+### 5. Simultaneous weight updates (batch flips)
 
-#### Stochastic minibatch training
-Use random subsets of error rows to compute derivative counts, improving scalability to larger datasets.
+Aggregate over several error rows and flip more than one beneficial weight per step. One caution carried over directly from Step 10: if several weights are flipped together, they need to be scored by their *combined* effect on true loss, not by summing individual single‑flip scores — two individually‑good flips aren't guaranteed to still be good together, for exactly the reason Step 10 exists.
 
-#### Scaling with NumPy / C++ / GPU
-Move the core forward and backward operations to array‑based or compiled code for larger input sizes and deeper networks. The Boolean operations are highly amenable to bit‑wise vectorisation.
+### 6. Stochastic minibatch training
 
----
+Use random subsets of error rows to compute derivative counts, improving scalability to larger datasets. Pairs naturally with idea #1 (bit‑packing) if the minibatch itself is represented as a bitmask.
 
-### Long‑term
+### 7. A genuinely O(depth) exact backward pass
 
-#### Theoretical analysis and comparisons
-- Relate the training dynamics to PAC learning bounds and Boolean circuit complexity.
-- Compare empirically with the recently published Boolean variation‑based backprop (XNOR‑gate neurons) to highlight the unique properties of the AND‑mask architecture.
+The open research‑y question, not a small patch. Would require tracking something richer than a single sensitivity bit per neuron — closer to a compact Boolean‑function summary of how the final output depends on the *set* of neurons affected by a given earlier signal, which starts to resemble BDD‑based (binary decision diagram) methods. Worth flagging as a long‑term direction rather than an immediate fix.
 
-#### Deeper optimization strategies
-- Explore hybrid methods that combine the current greedy global‑scoring with pure backprop‑style simultaneous flips.
-- Investigate whether a SAT solver can serve as a fallback when the learner gets stuck on hard functions.
+### Also still on the list
+
+- **Theoretical analysis:** relate training dynamics to PAC learning bounds and Boolean circuit complexity; compare empirically with published Boolean‑variation backprop (XNOR‑gate neurons).
+- **SAT solver fallback:** when the learner gets stuck on a genuinely hard function, finding a zero‑loss weight configuration is equivalent to a SAT problem — a SAT solver could serve as a last‑resort fallback.
 
 ---
 
 ### Speculative: connections to existing fields
 
 This project independently reconstructed ideas from several established fields. Exploring these connections could be fruitful:
+
+- **Reconvergent fanout / VLSI circuit testing (ATPG):** The exact problem behind why this project's backward pass can't cheaply compose sensitivities across layer boundaries (see "How This Compares to Standard Backprop" above) is the classical reconvergent‑fanout problem from digital circuit test‑pattern generation — the same reason algorithms like PODEM and the D‑algorithm can't treat fan‑out paths independently. The term "Boolean difference" for `f(v=0) XOR f(v=1)` itself originates in that literature (Sellers, Hsiao & Bearnson, 1968), which we arrived at independently before recognizing the connection. Circuit‑sensitivity and path‑sensitization techniques from that field are a plausible source of ideas for a smarter (possibly sub‑`O(depth²)`) backward pass.
 
 - **Binary Neural Networks (BNNs):** Real research area (XNOR-Net, BinaryConnect) that trains neural networks with binary weights using real-valued gradients as a proxy. Our approach is fully Boolean throughout — no real-valued gradient proxy.
 
