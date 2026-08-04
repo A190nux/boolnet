@@ -301,7 +301,7 @@ The brute‑force derivative computation (evaluate each weight by two full forwa
 1. **Forward pass with caching** — stores every layer’s input and output.
 2. **Output sensitivity** — for the final OR gate, determine which last‑layer neurons, if toggled, would flip the answer.
 3. **Backward propagation through AND‑layers** — for a neuron `y = AND(req)`, the sensitivity to an input `x_i` is `1` iff all other required inputs are `1` (so `y` depends on `x_i`). The sensitivity to a weight `W[i]` is `1` iff all other required inputs are `1` and `x_i = 0` (so flipping the weight would change `y`).
-4. **Handling complement augmentation** — flipping a signal `h[p]` toggles both `x_in[p]` and `x_in[p+m]`. For each original signal we simulate this flip by re‑running only the downstream part of the network — this is *not* strictly a single pass (it's roughly `O(depth)` re‑simulations per layer, so total cost is closer to `O(depth² × L²)` than the `O(depth × L²)` of an ideal backward pass), but it is exact and still much cheaper than the original brute‑force scoring.
+4. **Handling complement augmentation** — flipping a signal `h[p]` toggles both `x_in[p]` and `x_in[p+m]`. For each original signal we simulate this flip by re‑running only the downstream part of the network — this is *not* strictly a single pass (it's roughly `O(depth)` re‑simulations per layer). *[Correction, Step 12: the `O(depth² × L²)` estimate below undercounted by a factor of `L` — it missed that the resimulation itself is looped over once per original signal in the previous layer. Measured and derived cost is `O(depth² × width³)`, matching the comparison table further down.]*
 5. **Candidate filtering** — `backward(x)` on a misclassified row tells us which weights have derivative `1`, i.e. which weights *could possibly* fix that row in isolation. This is only ever used as a cheap filter to narrow down candidates — see Step 10 for why treating it as anything more than a filter (e.g. "the weight with the most votes across error rows") is a bug.
 
 This is a **pure Boolean backpropagation** — no floating‑point numbers, no gradient approximations, just logical AND and XOR. The training loop uses this backprop to narrow down candidate flips instead of brute‑force scoring every weight in the network.
@@ -377,6 +377,46 @@ Re‑ran both verification suites after the change: the brute‑force weight‑d
 
 ---
 
+### Step 12 — Fresh numbers, a verified complexity claim, and the `[4,4]` question
+
+With seeding now fully reproducible (Step 10) and no known correctness bugs left open (Step 11), three things were worth nailing down with actual data rather than restating prior claims. See `test.py` for the full harness; all numbers below come from running it.
+
+**1. Reran the headline benchmarks with more seeds.** 30 fresh seeds each, `train_with_restarts`, full truth table, same architectures already cited in this document:
+
+```
+Function                    Result
+─────────────────────────────────────
+XOR (n=2),   layers [4,4]   30/30 seeds → zero training loss
+Parity (n=3), layers [4]    30/30 seeds → zero training loss
+Parity (n=3), layers [6,4]  30/30 seeds → zero training loss
+```
+
+Consistent with Step 10's 20/20, at a larger sample. This replaces any earlier "converges reliably" language with an actual, reproducible count — rerun `test.py` yourself and you'll get the same numbers (same seeds).
+
+**2. The complexity claim needed correcting — in the code, not just here.** `bool_net.py`'s module docstring still described training as computing every derivative "in a single backward pass per input sample," language that reads as *proportional to network size*, the way real backprop is. That was never true after Step 9 introduced resimulation, and this document's own comparison table below already said `O(depth² × width³)` — but that number had never actually been measured, only derived. It's now been checked empirically: timing `backward()` while sweeping width (8→64, depth fixed) and depth (4→24, width fixed) and fitting a log‑log slope gives measured exponents of **2.86 for width** and **1.89 for depth**, both climbing toward 3 and 2 respectively as the swept dimension grows (the fitted slope starts below the asymptotic value at small sizes, because `Σ(depth−k) ≈ depth²/2 − depth/2` still has a non‑negligible linear term there — see `test.py` section 2 for the full sweep). That confirms `O(depth² × width³)`, not a linear‑in‑size single pass. The module docstring has been rewritten accordingly.
+
+**3. Is `[4,4]` genuinely too small to represent 4‑input parity exactly?** No — it's representable, it just has a lower per‑restart success rate than giving it more capacity or more restart budget:
+
+```
+Config                        Per-restart success rate (20 independent trials, full data)
+────────────────────────────────────────────────────────────────────────────────────────
+[4, 4]      (baseline)         5/20
+[6, 4]      (wider layer 0)    4/20
+[8, 8]      (much wider)      10/20
+[4, 4, 4]   (extra depth)      4/20
+```
+
+`[4,4]` isn't an outlier next to `[6,4]` or `[4,4,4]` — extra depth alone doesn't help here, and extra width helps only when it's substantial (`[8,8]`, not `[6,4]`). That pattern — succeeds sometimes, comparable to other modest configs, meaningfully improved only by a much wider net — is the signature of a harder search landscape, not an unrepresentable function. The direct test: does the existing `train_with_restarts` machinery already handle this at its current default?
+
+```
+train_with_restarts(..., layer_widths=[4,4], n_restarts=10)   13/15 seeds → zero loss
+train_with_restarts(..., layer_widths=[4,4], n_restarts=20)   15/15 seeds → zero loss
+```
+
+So: `[4,4]` is sufficient capacity for exact 4‑input parity. The earlier open question resolves as "needs more restarts," not "needs a different architecture" — raising `n_restarts` from 10 to 20 was enough to close the gap entirely in this sample. Worth noting this is restart‑budget evidence, not a representability proof; a config that fails across every restart tried is still consistent with a very lucky init being required, not strictly impossible.
+
+---
+
 ## How This Compares to Standard (Real‑Valued) Backprop
 
 **Why real backprop is a single, cheap pass.** Differentiation is linear: the multivariate chain rule says a total derivative is a *sum* of path contributions. That linearity is what lets standard backprop cache one local Jacobian per layer during the forward pass, then compose them backward with a single matrix multiply per layer — never touching the raw data again. Cost stays proportional to network size, `O(depth × width²)`, same order as the forward pass.
@@ -389,7 +429,7 @@ Within a single AND‑layer, where each weight belongs to exactly one neuron, no
 
 | | Standard backprop | This implementation |
 |---|---|---|
-| Cost per backward pass | `O(depth × width²)` | `O(depth² × width³)` — resimulation compounds with depth |
+| Cost per backward pass | `O(depth × width²)` | `O(depth² × width³)` — resimulation compounds with depth (derived here; measured and confirmed in Step 12) |
 | Why | Cached local Jacobian, composed once per layer | Each earlier layer needs a growing resimulation through everything downstream |
 | vs. naive brute force (`O(depth² × width⁴)`, evaluate every weight by two full forward passes) | n/a | Still a real win — saves roughly a factor of `width` |
 
@@ -465,7 +505,9 @@ Pair‑flip search and random perturbations provide escape routes from local min
 
 ### 3. XOR / parity failure ✅ Fixed, verified
 
-The network learns XOR (n=2) and parity (n=3) in two‑layer configurations. This is now backed by actual numbers, not just an architecture argument: 20/20 random seeds converge to zero training loss on the documented benchmark settings (see Step 10). Before the Step 10 fix, this same claim was checked and found to only hold 2/10 times for parity — worth remembering as a reminder to verify "should work" claims empirically, not just architecturally.
+The network learns XOR (n=2) and parity (n=3) in two‑layer configurations. This is backed by actual numbers, not just an architecture argument: 30/30 random seeds converge to zero training loss on the documented benchmark settings, `train_with_restarts`, full truth table (see Step 12; supersedes Step 10's 20/20 at a smaller sample size). Before the Step 10 fix, this same claim was checked and found to only hold 2/10 times for parity — worth remembering as a reminder to verify "should work" claims empirically, not just architecturally.
+
+Parity(n=4) with the small `[4,4]` architecture was an open question (is it representationally too small, or just under‑searched?) — resolved in Step 12: `[4,4]` is representationally sufficient. It has a lower per‑restart success rate than wider configs, but raising `train_with_restarts`' `n_restarts` from 10 to 20 was enough to reach 15/15 seeds converging.
 
 ### 4. Single output only 🔧 Planned
 

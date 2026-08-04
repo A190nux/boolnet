@@ -3,19 +3,30 @@ Boolean Neural Network — Full Multi-Layer Implementation with Backpropagation
 =============================================================================
 
 This module implements a neural network where every component is Boolean.
-Training is now performed by a true Boolean backpropagation algorithm:
-the Boolean derivative of the output w.r.t. every weight is computed in a
-single backward pass per input sample, using the Boolean chain rule.
+Training is performed by a Boolean backpropagation algorithm: the Boolean
+derivative of the output w.r.t. every weight is computed via a backward
+pass per input sample, using the Boolean chain rule.
+
+This is *not* a single pass whose cost is proportional to network size the
+way real-valued backprop's is. Composing sensitivities across a layer
+boundary isn't sound for a discrete Boolean derivative (see
+`_sens_through_augmentation`), so each layer's backward step re-simulates
+the forward pass through every remaining downstream layer. Measured cost
+per sample is closer to O(depth^2 x width^3) — see the README's "How This
+Compares to Standard Backprop" section for the derivation and benchmark.
 
 Key ideas
 ─────────
 1.  AND‑layer with complement augmentation (negation via extra inputs).
 2.  Boolean derivative (∂f/∂w = f(w=0) XOR f(w=1)) is computed via
-    chain rule during a backward pass — no brute‑force re‑evaluation.
-3.  Training: on each error row, backprop gives the set of weights that
-    would flip the output. We aggregate these over all error rows and
-    flip the weight that fixes the most errors.  Stuck escaping via
-    pair‑flip and random perturbation remains as a fallback.
+    chain rule during a backward pass — no brute‑force re‑evaluation,
+    but not a single linear-time pass either (see above).
+3.  Training: on each error row, backprop gives a *candidate* set of
+    weights whose flip would change the output on that row. Candidates
+    are then scored by their actual effect on total training loss (not
+    by raw vote count — see README Step 10), and the best-scoring flip
+    is applied. Pair‑flip and random perturbation remain as fallbacks
+    when no single flip helps.
 """
 
 import random
@@ -120,15 +131,23 @@ class BooleanLayer:
             return 0
         return int(self._required_met(x_in, j, exclude=i))
 
-    def mask_str(self, j: int, n_inputs: int) -> str:
-        """Human‑readable description of neuron j's AND‑mask."""
+    def mask_str(self, j: int, n_inputs: int, var_prefix: str = "x") -> str:
+        """
+        Human‑readable description of neuron j's AND‑mask.
+
+        `var_prefix` should be "x" only for a layer whose input really is
+        the network's original inputs (layer 0). For any later layer, the
+        "input" is actually the previous layer's neuron outputs, not the
+        original variables — pass a different prefix (e.g. "h") so the
+        printed formula doesn't misleadingly read as being about x0, x1, ...
+        """
         parts = []
         for i in range(self.input_width):
             if self.W[i][j] == 1:
                 if i < n_inputs:
-                    parts.append(f"x{i}")
+                    parts.append(f"{var_prefix}{i}")
                 else:
-                    parts.append(f"¬x{i - n_inputs}")
+                    parts.append(f"¬{var_prefix}{i - n_inputs}")
         return " ∧ ".join(parts) if parts else "1 (always)"
 
 
@@ -394,9 +413,10 @@ class BooleanNetwork:
         print("  Learned function:")
         for k, layer in enumerate(self.layers):
             prev_n = n if k == 0 else self.layer_widths[k-1]
-            print(f"  Layer {k}:")
+            var_prefix = "x" if k == 0 else "h"
+            print(f"  Layer {k}:" + ("" if k == 0 else f"  (h_i = layer {k-1}'s neuron i output)"))
             for j in range(layer.output_width):
-                label = layer.mask_str(j, prev_n)
+                label = layer.mask_str(j, prev_n, var_prefix=var_prefix)
                 active = "●" if k == len(self.layers)-1 and self.out_w[j] else " "
                 print(f"    {active} neuron {j}: {label}")
         active_out = [j for j in range(len(self.out_w)) if self.out_w[j]]
@@ -442,6 +462,7 @@ def train(
     train_data: dict,
     max_steps:  int  = 500,
     verbose:    bool = True,
+    seed:       int  = None,
 ) -> BooleanNetwork:
     """
     Train using Boolean backpropagation.
@@ -453,7 +474,13 @@ def train(
     4. Flip the weight with the highest count (if > 0).
     5. If no single flip helps, try a pair‑flip search among active weights.
     6. If still stuck, apply a small random perturbation.
+
+    `seed` controls the ONLY source of randomness inside this function (the
+    perturbation fallback in step 6). Pass a seed to make a training run
+    fully reproducible given the same net, data, and seed — otherwise this
+    behaves as before and draws from OS entropy, differing run to run.
     """
+    rng = random.Random(seed)
     MAX_STUCK = 5
     n_train = len(train_data)
     stuck_counter = 0
@@ -523,7 +550,11 @@ def train(
         if not active_wids:
             active_wids = set(all_wids)   # fallback to all weights
 
-        active_list = list(active_wids)
+        active_list = sorted(active_wids)  # deterministic order: a set's
+        # iteration order depends on string hashing, which Python salts
+        # differently per process (PYTHONHASHSEED) unless pinned — sorting
+        # by value removes that dependence so pair search order (and its
+        # tie-breaks in max(pair_scores, ...) below) is reproducible.
         pair_success = False
         # Try pairs on the first error row (quick filter)
         first_err = error_rows[0]
@@ -574,7 +605,7 @@ def train(
             safe = all_wids
         n_perturb = min(1 + stuck_counter // 2, 5)
         n_perturb = min(n_perturb, len(safe))
-        candidates = random.sample(safe, n_perturb)
+        candidates = rng.sample(safe, n_perturb)
         # Re-check safety against the UPDATED state right before each flip:
         # a weight sampled as safe against the pre-batch state can become
         # unsafe once an earlier flip in this same batch has been applied
@@ -606,9 +637,11 @@ def _log_flip(net, wid, score):
         new_val = net.layers[k].W[i][j]
         action = "ADD" if new_val else "REMOVE"
         prev_n = net.n_inputs if k == 0 else net.layer_widths[k-1]
-        inp_str = f"x{i-prev_n}" if i >= prev_n else f"x{i}"
+        var_prefix = "x" if k == 0 else "h"
         if i >= prev_n:
-            inp_str = f"¬x{i - prev_n}"
+            inp_str = f"¬{var_prefix}{i - prev_n}"
+        else:
+            inp_str = f"{var_prefix}{i}"
         msg = f"         → {action} connection [Layer {k}, input {inp_str} → neuron {j}]"
         if score is not None:
             msg += f"  (fixes {score} error{'s' if score!=1 else ''})"
@@ -634,17 +667,26 @@ def train_with_restarts(
     max_steps: int = 500,
     n_restarts: int = 10,
     verbose: bool = True,
+    seed: int = None,
 ) -> BooleanNetwork:
+    """
+    `seed` controls both the per-restart network initialization AND the
+    randomness inside each restart's train() call, so the entire multi-restart
+    run is reproducible end to end given the same seed. Leave it as None for
+    the previous behavior (draws from OS entropy, differs run to run).
+    """
+    rng = random.Random(seed)
     best_net = None
     best_loss = float('inf')
     for r in range(1, n_restarts + 1):
-        seed = random.randint(0, 2**31 - 1)
+        net_seed = rng.randint(0, 2**31 - 1)
+        train_seed = rng.randint(0, 2**31 - 1)
         if verbose:
             print(f"\n{'#'*64}")
-            print(f"  RESTART {r}/{n_restarts}  (seed={seed})")
+            print(f"  RESTART {r}/{n_restarts}  (seed={net_seed})")
             print(f"{'#'*64}")
-        net = BooleanNetwork(n_inputs=n_inputs, layer_widths=layer_widths, seed=seed)
-        train(net, train_data, max_steps=max_steps, verbose=verbose)
+        net = BooleanNetwork(n_inputs=n_inputs, layer_widths=layer_widths, seed=net_seed)
+        train(net, train_data, max_steps=max_steps, verbose=verbose, seed=train_seed)
         loss = compute_loss(net, train_data)
         if verbose:
             print(f"  Restart {r} finished with loss {loss}/{len(train_data)}")
