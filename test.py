@@ -1,5 +1,5 @@
 """
-test.py — Three investigations, each producing numbers to fold back into the README:
+test.py — Four investigations, each producing numbers to fold back into the README:
 
   1. Rerun XOR(n=2) and Parity(n=3) convergence stats with real, reproducible seeds
      (replaces old convergence claims with numbers from THIS run).
@@ -7,6 +7,9 @@ test.py — Three investigations, each producing numbers to fold back into the R
      to check the documented complexity claim against reality.
   3. Probe whether layer_widths=[4,4] can represent 4-input parity exactly, or
      whether it needs more restarts / a wider config.
+  4. Measure whether Boolean regularization (lam > 0) improves test accuracy.
+
+Fast correctness tests live in tests/ (python3 -m unittest discover -s tests).
 
 Run: python3 test.py
 """
@@ -192,7 +195,50 @@ def run_representability_section():
     print()
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 4. Does Boolean regularization improve generalization?
+# ─────────────────────────────────────────────────────────────────────────────
+
+def run_regularization_section(n_seeds=8, lams=(0.0, 0.1, 0.5)):
+    """
+    Partial-data generalization with and without the complexity penalty
+    (objective = errors + lam × active weights). Each seed is a different
+    train/test split AND a different training seed; numbers are averaged.
+    Parity is deliberately absent: every Hamming neighbour of a held-out
+    parity row has the opposite label, so any simplicity bias predicts it
+    wrong — it measures nothing about regularization.
+    """
+    print("=" * 78)
+    print("4. REGULARIZATION: test accuracy vs lam (partial truth tables)")
+    print("=" * 78)
+    cases = [
+        ("Majority n=5, 75%",   5, majority,     [8, 4], 0.75),
+        ("Majority n=5, 50%",   5, majority,     [8, 4], 0.50),
+        ("AtLeastTwo n=5, 50%", 5, at_least_two, [8, 4], 0.50),
+        ("custom n=4, 50%",     4, custom,       [4, 4], 0.50),
+        ("custom n=4, 75%",     4, custom,       [4, 4], 0.75),
+    ]
+    for desc, n, fn, widths, frac in cases:
+        print(f"  {desc}  widths={widths}")
+        for lam in lams:
+            tr_acc = te_acc = size = 0.0
+            t0 = time.perf_counter()
+            for s in range(n_seeds):
+                train_data, test_data = make_dataset(n, fn, observed_fraction=frac,
+                                                     seed=100 + s)
+                net = train_with_restarts(n, widths, train_data, n_restarts=5,
+                                          verbose=False, seed=s, lam=lam)
+                a, b = evaluate(net, train_data, test_data, verbose=False)
+                tr_acc += a; te_acc += b; size += net.complexity()
+            print(f"    lam={lam:<4}  train {100*tr_acc/n_seeds:5.1f}%   "
+                  f"test {100*te_acc/n_seeds:5.1f}%   "
+                  f"active weights {size/n_seeds:5.1f}   "
+                  f"({time.perf_counter() - t0:.0f}s)")
+    print()
+
+
 if __name__ == "__main__":
     run_convergence_section()
     run_complexity_section()
     run_representability_section()
+    run_regularization_section()

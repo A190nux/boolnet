@@ -417,6 +417,46 @@ So: `[4,4]` is sufficient capacity for exact 4‑input parity. The earlier open 
 
 ---
 
+### Step 13 — Boolean regularization (the Occam's razor penalty)
+
+Once training reliably reached zero loss (Step 10), overfitting stopped being hidden: the net would memorize the training rows with roughly 45–50 active weights for a 5‑input function that needs only a handful. The objective is now:
+
+```
+objective = training_errors + λ × (number of active weights)
+```
+
+`train(..., lam=λ)` and `train_with_restarts(..., lam=λ)` use it in four places:
+
+1. **Flip scoring:** single and pair candidates are scored by the change in the objective, not just in errors.
+2. **Best‑state restore:** `train` restores the lowest‑objective state it saw, so a late random perturbation can't leave the net worse than its best.
+3. **Final `prune()` pass:** a greedy pass removes any active weight whose removal lowers the objective. With λ < 1, that means "drop every connection that doesn't cost a training error."
+4. **Restart selection:** with λ > 0, `train_with_restarts` runs every restart (an equally accurate but simpler net may come later) and keeps the one with the lowest objective.
+
+`lam=0` is the default and behaves exactly as before. This was checked against weight‑level fingerprints of trained networks from the pre‑change code, and it's now pinned by a regression test.
+
+**Results** (`test.py` section 4). Each of 8 seeds uses a different train/test split and a different training seed; `n_restarts=5`.
+
+```
+Function / split          λ=0                      λ=0.1                    λ=0.5
+                          train  test  |W|         train  test  |W|         train  test  |W|
+Majority n=5, 75%         99.5%  56.2%  46.6       100%   59.4%  18.4       92.2%  56.2%  10.2
+Majority n=5, 50%         100%   57.0%  45.5       100%   60.9%  11.5       92.2%  60.2%   6.9
+AtLeastTwo n=5, 50%       100%   64.1%  51.9       100%   68.0%   6.5       96.9%  66.4%   4.1
+custom n=4, 50%           100%   57.8%  25.8       100%   64.1%   6.8       92.2%  64.1%   4.4
+custom n=4, 75%           100%   68.8%  23.9       100%   90.6%   8.4       96.9%  71.9%   7.1
+```
+
+What this shows:
+
+- **λ=0.1 is a clear improvement in every case.** Networks are 2.5–8× smaller with no loss of training accuracy, and test accuracy goes up 3–22 points. The biggest gain is `custom` at 75%, where the true function is genuinely small.
+- **λ=0.5 overshoots.** It starts giving up training rows (92–97%) to get a smaller net, and test accuracy doesn't improve on λ=0.1. That's expected: once whole networks are compared, any λ accepts one extra training error in exchange for more than 1/λ fewer weights.
+- **Majority is still near chance (≈60%).** A threshold function has no small description as an AND‑of‑ANDs over this architecture's literals, so "fewest weights" isn't the right bias for it. Fewer weights helps, but it isn't enough on its own.
+- **Caveats:** the test sets are small (8–16 rows), so these are trends, not tight estimates. λ > 0 also costs 2–10× more wall‑clock time, because every restart runs and the pruning pass re‑checks the whole dataset for each weight. Bit‑packing (Future Plans #1) is the natural fix for that.
+
+Parity is deliberately left out of this comparison. Every input that differs from a held‑out parity row by one bit has the opposite label, so any simplicity bias predicts it wrong: 4‑input parity on a 75% split gets 100% train / 0% test, with or without λ. That's the right answer for an Occam learner, not a bug.
+
+---
+
 ## How This Compares to Standard (Real‑Valued) Backprop
 
 **Why real backprop is a single, cheap pass.** Differentiation is linear: the multivariate chain rule says a total derivative is a *sum* of path contributions. That linearity is what lets standard backprop cache one local Jacobian per layer during the forward pass, then compose them backward with a single matrix multiply per layer — never touching the raw data again. Cost stays proportional to network size, `O(depth × width²)`, same order as the forward pass.
@@ -447,6 +487,9 @@ Three more scaling dimensions worth separating out:
 | File | Description |
 |------|-------------|
 | `bool_net.py` | Full multi‑layer Boolean neural network with backpropagation |
+| `tests/test_bool_net.py` | Fast regression tests (~6s): backward exactness vs brute force, convergence, reproducibility, regularization. Run `python3 -m unittest discover -s tests -v` |
+| `test.py` | Slower experiment harness that produces the README's numbers |
+| `boolean_learner.py` / `.html` | Earlier single‑layer version |
 
 ### Architecture
 
@@ -469,8 +512,13 @@ BooleanNetwork
   _backward_layer(...)        → backprop through one AND‑layer
   _sens_through_augmentation(…) → backprop through complement augmentation
 
-_score_flip(net, data, wid)    → true loss delta from a single candidate flip
-_score_pair_flip(net, data, a, b) → true loss delta from a candidate pair flip
+complexity()                → number of active weights (what λ penalizes)
+get_state() / set_state(s)  → weight snapshot / restore
+
+compute_objective(net, data, lam) → errors + lam × active weights
+_score_single_flip(net, data, wid, lam) → true objective delta from a single candidate flip
+_score_pair_flip(net, data, a, b, lam)  → true objective delta from a candidate pair flip
+prune(net, data, lam)          → greedily remove weights that don't pay for themselves
 train(net, train_data, ...)    → backprop‑filtered candidates, scored by true loss, with pair/perturbation fallbacks
 train_with_restarts(...)       → multiple seeds, keep best
 evaluate(...)                   → accuracy report
@@ -489,6 +537,10 @@ train_data, test_data = make_dataset(n=2, target_fn=my_fn, observed_fraction=0.7
 net = BooleanNetwork(n_inputs=2, layer_widths=[4, 4], seed=42)
 train(net, train_data, max_steps=500, verbose=True)
 evaluate(net, train_data, test_data, verbose=True)
+
+# With Boolean regularization (prefer simpler networks — see Step 13):
+net = train_with_restarts(n_inputs=2, layer_widths=[4, 4], train_data=train_data,
+                          lam=0.1, verbose=False, seed=0)
 ```
 
 ---
@@ -513,9 +565,9 @@ Parity(n=4) with the small `[4,4]` architecture was an open question (is it repr
 
 The current network predicts a single Boolean value. Multi‑class / multi‑label output requires extending the output layer to a vector of OR gates.
 
-### 5. No regularization 🔧 Planned
+### 5. No regularization ✅ Implemented (Step 13)
 
-The network can overfit on small training sets. Boolean L1/L2 regularization (preferring simpler functions) and early stopping are on the roadmap.
+`lam` penalizes active weights. At λ=0.1 networks are 2.5–8× smaller with no loss of training accuracy, and test accuracy goes up on every benchmarked function. Generalization on threshold functions like majority is still weak (≈60%), because "fewest weights" isn't the right inductive bias for them.
 
 ---
 
@@ -531,15 +583,13 @@ The one idea here that's specific to Boolean networks in a way real backprop can
 
 `_sens_through_augmentation` currently resimulates through *every* downstream neuron regardless of whether it actually depends on the flipped signal. Many won't — their AND‑mask never touches that wire or its complement. Skipping neurons outside the cone of influence shrinks the constant factor without changing the algorithm's structure.
 
-### 3. Boolean regularization
+### 3. Boolean regularization ✅ Done (Step 13), follow‑ups remain
 
-Now more urgent than when this was first listed: now that training reliably reaches zero loss (Step 10), overfitting shows up unmasked instead of being hidden behind convergence failures. Concretely observed: Majority (`n=5`, 75/25 split) went from 100% train / 50% test *before* the Step 10 fix to 100% train / 12.5% test *after* — the model has more room to memorize now that it isn't stuck. The plan is unchanged, just more urgent:
-
-```
-Loss = training_errors + λ × (number of active weights)
-```
-
-When two candidate flips fix the same number of errors, prefer the one that results in fewer total active weights — the Boolean Occam's razor.
+The basic penalty works (see Step 13). Open follow‑ups:
+- **Count only live weights:** weights in neurons the output can't see shouldn't count, but `complexity()` currently counts them.
+- **Better pruning:** try pair or swap moves in `prune()` (remove two, add one), not only single removals.
+- **Choose λ by validation** instead of fixing it by hand.
+- **Better inductive biases** for threshold‑like functions, where fewest‑weights alone doesn't help.
 
 ### 4. Multiple outputs
 
@@ -611,7 +661,7 @@ Failure modes
   Dying ReLU                        Dead neuron (x ∧ ¬x) — fixed by init
   Local minimum / saddle point      Escaped via pair flips & restarts
   XOR fails on 1 layer              Same — proven impossible
-  Overfitting                       Same — regularization planned
+  Overfitting                       Same — λ × active weights penalty
 
 Generalization
   Train/test split                  Partial truth table observation

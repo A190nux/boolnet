@@ -396,6 +396,26 @@ class BooleanNetwork:
                         return True
         return False
 
+    def complexity(self) -> int:
+        """
+        Number of active (=1) weights: AND-layer connections plus connected
+        output gates. This is the description length the regularizer
+        penalizes; fewer literals per AND-neuron means a more general term.
+        """
+        return (sum(sum(row) for layer in self.layers for row in layer.W)
+                + sum(self.out_w))
+
+    def get_state(self):
+        """Snapshot of all weights (for restoring the best state seen)."""
+        return ([[row[:] for row in layer.W] for layer in self.layers],
+                self.out_w[:])
+
+    def set_state(self, state):
+        Ws, out_w = state
+        for layer, W in zip(self.layers, Ws):
+            layer.W = [row[:] for row in W]
+        self.out_w = out_w[:]
+
     # ── Description ─────────────────────────────────────────────────────────
 
     def describe(self):
@@ -431,26 +451,82 @@ def compute_loss(net: BooleanNetwork, data: dict) -> int:
     return sum(net(x) != y for x, y in data.items())
 
 
-def _score_pair_flip(net, data, wid_a, wid_b):
-    old = compute_loss(net, data)
+def compute_objective(net: BooleanNetwork, data: dict, lam: float = 0.0):
+    """
+    Regularized training objective:
+
+        objective = training_errors + lam × (number of active weights)
+
+    With lam == 0 this is exactly compute_loss (an int). For a *single*
+    flip with 0 < lam < 1, fixing an error always outweighs the ±1 change
+    in complexity, so step-by-step the penalty acts as a tie-breaker. But
+    whole networks are compared too (best-state restore in train(), restart
+    selection in train_with_restarts), and there any lam > 0 will accept
+    one extra training error in exchange for more than 1/lam fewer weights.
+    Measured (README Step 13): lam=0.1 kept 100% train accuracy while
+    shrinking nets 3-8×; lam=0.5 started giving up training rows.
+    """
+    loss = compute_loss(net, data)
+    if lam == 0:
+        return loss
+    return loss + lam * net.complexity()
+
+
+def _score_pair_flip(net, data, wid_a, wid_b, lam=0.0):
+    old = compute_objective(net, data, lam)
     net.flip_weight(wid_a)
     net.flip_weight(wid_b)
-    new = compute_loss(net, data)
+    new = compute_objective(net, data, lam)
     net.flip_weight(wid_b)
     net.flip_weight(wid_a)
     return old - new
 
 
-def _score_single_flip(net, data, wid):
-    """Net loss reduction (old - new) from applying a single flip, over the
-    FULL dataset — not just the error rows that voted for it. A flip that
+def _score_single_flip(net, data, wid, lam=0.0):
+    """Net objective reduction (old - new) from applying a single flip, over
+    the FULL dataset — not just the error rows that voted for it. A flip that
     fixes some error rows can simultaneously break rows that were already
-    correct; this is what actually decides whether the flip helps."""
-    old = compute_loss(net, data)
+    correct; this is what actually decides whether the flip helps. With
+    lam > 0 the change in active-weight count is included too."""
+    old = compute_objective(net, data, lam)
     net.flip_weight(wid)
-    new = compute_loss(net, data)
+    new = compute_objective(net, data, lam)
     net.flip_weight(wid)
     return old - new
+
+
+def prune(net: BooleanNetwork, data: dict, lam: float, verbose: bool = False) -> int:
+    """
+    Greedy Boolean Occam's razor: repeatedly remove the active weight whose
+    removal most reduces the regularized objective, until no removal helps.
+    For 0 < lam < 1 this means "drop any connection that doesn't cost a
+    training error". Removing a weight can never create a contradiction,
+    so no safety check is needed. Returns the number of weights removed.
+    """
+    if lam <= 0:
+        return 0
+    removed = 0
+    while True:
+        best_wid, best_score = None, 0
+        for wid in net.all_weight_ids():      # deterministic order
+            if _weight_value(net, wid) != 1:
+                continue
+            score = _score_single_flip(net, data, wid, lam)
+            if score > best_score:
+                best_wid, best_score = wid, score
+        if best_wid is None:
+            return removed
+        net.flip_weight(best_wid)
+        removed += 1
+        if verbose:
+            _log_flip(net, best_wid, None)
+
+
+def _weight_value(net, wid) -> int:
+    if wid[0] == 'layer':
+        _, k, i, j = wid
+        return net.layers[k].W[i][j]
+    return net.out_w[wid[1]]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -463,6 +539,7 @@ def train(
     max_steps:  int  = 500,
     verbose:    bool = True,
     seed:       int  = None,
+    lam:        float = 0.0,
 ) -> BooleanNetwork:
     """
     Train using Boolean backpropagation.
@@ -479,8 +556,16 @@ def train(
     perturbation fallback in step 6). Pass a seed to make a training run
     fully reproducible given the same net, data, and seed — otherwise this
     behaves as before and draws from OS entropy, differing run to run.
+
+    `lam` is the Boolean regularization strength (see compute_objective).
+    With lam == 0 (default) training is unchanged. With lam > 0, candidate
+    flips are scored by the regularized objective, the lowest-objective
+    state seen is restored at the end (a late random perturbation can't
+    leave the net worse than its best), and a final prune() pass removes
+    every connection that isn't paying for itself.
     """
     rng = random.Random(seed)
+    best_state, best_obj = None, float('inf')
     MAX_STUCK = 5
     n_train = len(train_data)
     stuck_counter = 0
@@ -496,7 +581,12 @@ def train(
     for step in range(1, max_steps + 1):
         loss = compute_loss(net, train_data)
         if verbose:
-            print(f"\nStep {step:>4}  |  Loss {loss}/{n_train}")
+            reg = f"  |  active weights {net.complexity()}" if lam else ""
+            print(f"\nStep {step:>4}  |  Loss {loss}/{n_train}{reg}")
+        if lam:
+            obj = compute_objective(net, train_data, lam)
+            if obj < best_obj:
+                best_obj, best_state = obj, net.get_state()
 
         if loss == 0:
             if verbose:
@@ -525,7 +615,7 @@ def train(
         )
         best_wid, best_net_score = None, 0
         for wid in safe_candidates:
-            score = _score_single_flip(net, train_data, wid)
+            score = _score_single_flip(net, train_data, wid, lam)
             if score > best_net_score:
                 best_net_score, best_wid = score, wid
 
@@ -578,7 +668,7 @@ def train(
                     pair_candidates.append((wa, wb))
 
         if pair_candidates:
-            pair_scores = {pair: _score_pair_flip(net, train_data, pair[0], pair[1])
+            pair_scores = {pair: _score_pair_flip(net, train_data, pair[0], pair[1], lam)
                            for pair in pair_candidates}
             best_pair = max(pair_scores, key=pair_scores.get)
             best_pair_score = pair_scores[best_pair]
@@ -626,6 +716,14 @@ def train(
     else:
         if verbose:
             print(f"\n  ✗ Did not converge within {max_steps} steps.")
+
+    if lam:
+        if compute_objective(net, train_data, lam) > best_obj:
+            net.set_state(best_state)
+        n_removed = prune(net, train_data, lam, verbose=verbose)
+        if verbose:
+            print(f"  Pruned {n_removed} weight(s) → {net.complexity()} active, "
+                  f"loss {compute_loss(net, train_data)}/{n_train}")
     return net
 
 
@@ -668,12 +766,17 @@ def train_with_restarts(
     n_restarts: int = 10,
     verbose: bool = True,
     seed: int = None,
+    lam: float = 0.0,
 ) -> BooleanNetwork:
     """
     `seed` controls both the per-restart network initialization AND the
     randomness inside each restart's train() call, so the entire multi-restart
     run is reproducible end to end given the same seed. Leave it as None for
     the previous behavior (draws from OS entropy, differs run to run).
+
+    With lam > 0 every restart runs (no early stop at zero loss, since a
+    later restart may find an equally accurate but simpler network) and the
+    restart with the lowest regularized objective is kept.
     """
     rng = random.Random(seed)
     best_net = None
@@ -686,14 +789,16 @@ def train_with_restarts(
             print(f"  RESTART {r}/{n_restarts}  (seed={net_seed})")
             print(f"{'#'*64}")
         net = BooleanNetwork(n_inputs=n_inputs, layer_widths=layer_widths, seed=net_seed)
-        train(net, train_data, max_steps=max_steps, verbose=verbose, seed=train_seed)
-        loss = compute_loss(net, train_data)
+        train(net, train_data, max_steps=max_steps, verbose=verbose,
+              seed=train_seed, lam=lam)
+        loss = compute_objective(net, train_data, lam)
         if verbose:
-            print(f"  Restart {r} finished with loss {loss}/{len(train_data)}")
+            label = "objective" if lam else "loss"
+            print(f"  Restart {r} finished with {label} {loss}")
         if loss < best_loss:
             best_loss = loss
             best_net = net
-            if loss == 0:
+            if loss == 0 and not lam:
                 if verbose:
                     print("  ✓ Perfect solution found, stopping restarts.")
                 break
