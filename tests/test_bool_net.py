@@ -15,7 +15,8 @@ import random
 import unittest
 
 from bool_net import (
-    BooleanNetwork, all_inputs, compute_loss, compute_objective, make_dataset,
+    BooleanNetwork, PackedData, all_inputs, compute_loss, compute_objective,
+    error_mask, make_dataset,
     majority, parity, prune, train, train_with_restarts, xor2, custom,
 )
 
@@ -69,12 +70,63 @@ class TestBackwardExactness(unittest.TestCase):
                     checked += len(expected)
         self.assertGreater(checked, 10_000)
 
+    def test_packed_backward_matches_rowwise_and_brute_force(self):
+        rng = random.Random(4321)
+        shapes = [(2, [3]), (2, [4, 4]), (3, [5, 3]), (3, [3, 3, 3]),
+                  (4, [6, 2, 3]), (7, [5, 4])]          # n=7: 128-bit masks
+        for n, widths in shapes:
+            rows = all_inputs(n)
+            for _ in range(10):
+                net = random_net(rng, n, widths)
+                data = {x: 0 for x in rng.sample(rows, rng.randint(1, len(rows)))}
+                pd = PackedData(data)
+                subset = rng.getrandbits(pd.n_rows)      # random row selection
+                masks = net.backward_packed(pd, subset)
+                for r, x in enumerate(pd.rows):
+                    brute = brute_force_derivs(net, x)
+                    rowwise = net.backward(x)
+                    for wid in net.all_weight_ids():
+                        got = (masks.get(wid, 0) >> r) & 1
+                        want = brute[wid] if (subset >> r) & 1 else 0
+                        self.assertEqual(got, want, f"n={n} {widths} x={x} {wid}")
+                        if (subset >> r) & 1:
+                            self.assertEqual(rowwise.get(wid, 0), want)
+
     def test_backward_does_not_mutate_net(self):
         net = BooleanNetwork(3, [4, 4], seed=7)
         before = weights_fingerprint(net)
         for x in all_inputs(3):
             net.backward(x)
         self.assertEqual(weights_fingerprint(net), before)
+
+
+class TestBitPacking(unittest.TestCase):
+    """forward_packed / compute_loss must agree with per-row forward()."""
+
+    def test_packed_forward_matches_rowwise(self):
+        rng = random.Random(77)
+        # n=7 gives 128 rows — wider than a machine word, so big-int
+        # masks are exercised, not just small ones.
+        for n, widths in [(2, [3]), (3, [4, 4]), (4, [5, 3, 2]), (7, [6, 4])]:
+            rows = all_inputs(n)
+            for _ in range(20):
+                net = random_net(rng, n, widths)
+                sub = rng.sample(rows, rng.randint(1, len(rows)))
+                data = {x: rng.randint(0, 1) for x in sub}
+                pd = PackedData(data)
+                out = net.forward_packed(pd)
+                for r, x in enumerate(pd.rows):
+                    self.assertEqual((out >> r) & 1, net(x), f"n={n} x={x}")
+                self.assertEqual(compute_loss(net, pd),
+                                 sum(net(x) != y for x, y in data.items()))
+                self.assertEqual(compute_loss(net, data), compute_loss(net, pd))
+                # error rows come back in the dict's own order
+                self.assertEqual(pd.rows_in(error_mask(net, pd)),
+                                 [x for x, y in data.items() if net(x) != y])
+
+    def test_empty_dataset(self):
+        net = BooleanNetwork(3, [4], seed=0)
+        self.assertEqual(compute_loss(net, {}), 0)
 
 
 class TestInitialization(unittest.TestCase):

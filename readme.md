@@ -457,6 +457,38 @@ Parity is deliberately left out of this comparison. Every input that differs fro
 
 ---
 
+### Step 14 — Bit‑packing the dataset (forward *and* backward)
+
+Profiling showed about 87% of training time inside `compute_loss`. Every candidate flip is scored against the full dataset, and that meant one Python `forward()` per row. Now:
+
+- **`PackedData`** stores the dataset column‑wise: input *i* becomes one integer whose bit *r* is that input's value on row *r*, and the labels are stored the same way. It's built once per `train()` call.
+- **`forward_packed`:** an AND‑neuron's output over the whole dataset is `&` of its required inputs' masks. That's one big‑int operation per connection, however many rows there are. The loss is `popcount(output ^ labels)`.
+- **`backward_packed`** runs the backward pass for every error row at once. This stays exact because every step of `backward()` (local AND derivatives, and re‑simulating a flipped signal through the downstream layers) acts on each row independently, so it can act on all rows' bits together. Each weight gets a mask of the rows where its derivative is 1, and its vote count is `popcount(mask)`. The pair search reuses these masks instead of re‑running backward on every error row.
+
+**No behavior change, verified two ways.**
+1. Across 30 trained networks (6 function/architecture/split configs × 5 seeds), the weights match the per‑row implementation bit for bit. That includes tie‑breaks: votes are inserted in the order the old per‑row loop used (first error row where the derivative is 1, then canonical weight order).
+2. New tests compare `forward_packed`, `compute_loss` and `backward_packed` against per‑row `forward()`/`backward()` and brute force on random networks, including 128‑row datasets, so the masks are wider than a machine word. The per‑row functions stay in the code as the reference.
+
+**Speed:** 3 seeds × `train_with_restarts(n_restarts=5)`, wall‑clock on one machine.
+
+```
+Case                    λ     per-row (before)   bit-packed   speedup
+Majority n=5, 75%       0          12.37s           6.93s       1.8×
+AtLeastTwo n=5, 50%     0           0.39s           0.15s       2.6×
+custom n=4, 75%         0           0.45s           0.04s      11×
+Parity n=4, full        0          26.84s          10.61s       2.5×
+Majority n=5, 75%       0.1        31.86s           2.18s      14.6×
+AtLeastTwo n=5, 50%     0.1         7.38s           0.78s       9.5×
+custom n=4, 75%         0.1         1.68s           0.43s       3.9×
+Parity n=4, full        0.1        41.88s           9.99s       4.2×
+```
+
+The λ>0 runs gain the most, because pruning is almost entirely loss evaluations. That was Step 13's cost caveat, now mostly paid off.
+
+**Where the remaining time goes.** In the λ=0 majority case, about 80% is now the pair‑search pre‑filter. For each of O(active²) candidate pairs it flips both weights, runs a per‑row `forward()` on the first error row, and calls a full‑network `has_contradiction()`. Bit‑packing doesn't touch that loop. The obvious fixes are a single‑row `forward_packed`, a contradiction check limited to the two flipped neurons, and incremental re‑evaluation of only the neurons a flip affects. Those are the next target. The `O(depth² × width³)` re‑simulation inside backward is still there too; it's now paid once per step instead of once per error row.
+
+---
+
 ## How This Compares to Standard (Real‑Valued) Backprop
 
 **Why real backprop is a single, cheap pass.** Differentiation is linear: the multivariate chain rule says a total derivative is a *sum* of path contributions. That linearity is what lets standard backprop cache one local Jacobian per layer during the forward pass, then compose them backward with a single matrix multiply per layer — never touching the raw data again. Cost stays proportional to network size, `O(depth × width²)`, same order as the forward pass.
@@ -507,7 +539,9 @@ BooleanNetwork
   out_w:  list[int]           output gate weights
   forward(x)                  → full forward pass
   forward_with_cache(x)       → output + intermediate values
-  backward(x)                 → dict {weight_id: derivative} for all weights
+  backward(x)                 → dict {weight_id: derivative} for all weights (one row)
+  forward_packed(pd)          → output bitmask over every row of a PackedData at once
+  backward_packed(pd, rows)   → dict {weight_id: row-mask of derivative=1} (all rows at once)
   _output_sensitivity(h_last) → which last‑layer neurons affect the output
   _backward_layer(...)        → backprop through one AND‑layer
   _sens_through_augmentation(…) → backprop through complement augmentation
@@ -515,6 +549,8 @@ BooleanNetwork
 complexity()                → number of active weights (what λ penalizes)
 get_state() / set_state(s)  → weight snapshot / restore
 
+PackedData(data)               → dataset as per-input bitmasks (bit r = row r); built once per train()
+compute_loss(net, data)        → popcount(output_mask XOR label_mask); accepts dict or PackedData
 compute_objective(net, data, lam) → errors + lam × active weights
 _score_single_flip(net, data, wid, lam) → true objective delta from a single candidate flip
 _score_pair_flip(net, data, a, b, lam)  → true objective delta from a candidate pair flip
@@ -575,7 +611,7 @@ The current network predicts a single Boolean value. Multi‑class / multi‑lab
 
 Roughly in priority order — highest expected value for lowest conceptual risk first.
 
-### 1. Bit‑pack the dataset dimension
+### 1. Bit‑pack the dataset dimension ✅ Done (Step 14)
 
 The one idea here that's specific to Boolean networks in a way real backprop can't exploit: represent each neuron's output *across the entire training set* as a single integer bitmask (or a NumPy bit array), and turn `forward()` for a whole layer into a handful of bitwise AND/OR/XOR operations over those masks instead of a Python loop over rows. This doesn't fix the `O(depth²)` resimulation cost from the comparison section above, but it collapses the dataset‑size dimension out of the complexity almost entirely — probably the biggest win for the least risk, and a natural fit for the "Scaling with NumPy" idea already below, made concrete.
 

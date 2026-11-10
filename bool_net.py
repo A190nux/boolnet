@@ -27,6 +27,12 @@ Key ideas
     by raw vote count — see README Step 10), and the best-scoring flip
     is applied. Pair‑flip and random perturbation remain as fallbacks
     when no single flip helps.
+4.  Bit-packing: training data is stored column-wise as integer bitmasks
+    (PackedData), so forward_packed() evaluates the whole dataset with one
+    big-int AND per connection, and backward_packed() runs the backward
+    pass for every error row at once. Results are bit-for-bit identical to
+    the per-row forward()/backward(), which are kept as the reference.
+5.  Regularization: optional `lam` penalizes active weights (README Step 13).
 """
 
 import random
@@ -45,6 +51,59 @@ def augment(x: tuple) -> tuple:
 def all_inputs(n: int) -> list:
     """All 2^n binary input tuples for n variables."""
     return list(iter_product([0, 1], repeat=n))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Bit-packed dataset
+# ─────────────────────────────────────────────────────────────────────────────
+
+class PackedData:
+    """
+    A dataset stored column-wise as bitmasks: bit r of x_masks[i] is the
+    value of input i on row r, and bit r of y_mask is row r's label. A
+    neuron's output over the WHOLE dataset is then a single integer, and an
+    AND-neuron is just `&` of its required input masks — one Python big-int
+    operation per connection instead of a loop over rows.
+
+    Rows keep the dict's iteration order, so row r here is the r-th key of
+    the original dict (this keeps error-row order, and therefore training's
+    tie-breaks, identical to the unpacked code).
+    """
+
+    def __init__(self, data: dict):
+        self.rows = list(data.keys())
+        self.n_rows = len(self.rows)
+        self.full = (1 << self.n_rows) - 1
+        n_inputs = len(self.rows[0]) if self.rows else 0
+        x_masks = [0] * n_inputs
+        y_mask = 0
+        for r, (x, y) in enumerate(data.items()):
+            bit = 1 << r
+            for i, v in enumerate(x):
+                if v:
+                    x_masks[i] |= bit
+            if y:
+                y_mask |= bit
+        self.x_masks = x_masks
+        self.y_mask = y_mask
+        # Augmented inputs [x, ¬x] for layer 0, precomputed once.
+        self.aug_masks = x_masks + [~m & self.full for m in x_masks]
+
+    def __len__(self):
+        return self.n_rows
+
+    def rows_in(self, mask: int) -> list:
+        """The rows whose bit is set in mask, in row order."""
+        out = []
+        while mask:
+            low = mask & -mask
+            out.append(self.rows[low.bit_length() - 1])
+            mask ^= low
+        return out
+
+
+def as_packed(data) -> PackedData:
+    return data if isinstance(data, PackedData) else PackedData(data)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -207,6 +266,34 @@ class BooleanNetwork:
     def __call__(self, x: tuple) -> int:
         return self.forward(x)
 
+    def forward_packed(self, pd: PackedData) -> int:
+        """
+        Forward pass over every row of a PackedData at once. Returns the
+        output bitmask (bit r = network output on row r). Equivalent to
+        calling forward() on each row, but costs one big-int AND per active
+        connection regardless of the number of rows.
+        """
+        if pd.n_rows == 0:      # no rows: can't infer input width, and
+            return 0            # there's nothing to evaluate anyway
+        full = pd.full
+        h = pd.aug_masks
+        last = len(self.layers) - 1
+        for k, layer in enumerate(self.layers):
+            W = layer.W
+            outs = []
+            for j in range(layer.output_width):
+                m = full
+                for i in range(layer.input_width):
+                    if W[i][j]:
+                        m &= h[i]
+                outs.append(m)
+            h = outs if k == last else outs + [~m & full for m in outs]
+        out = 0
+        for j, w in enumerate(self.out_w):
+            if w:
+                out |= h[j]
+        return out
+
     # ── Sensitivity computations for backpropagation ───────────────────────
 
     def _output_sensitivity(self, h_last: tuple) -> list:
@@ -333,6 +420,130 @@ class BooleanNetwork:
 
         return all_derivs
 
+    # ── Bit-packed backward pass (all rows at once) ─────────────────────────
+
+    def _forward_packed_from(self, k: int, h_aug: list, full: int) -> int:
+        """Packed forward starting at layer k, given its augmented input
+        masks. Returns the output mask."""
+        last = len(self.layers) - 1
+        h = h_aug
+        for k2 in range(k, last + 1):
+            layer = self.layers[k2]
+            W = layer.W
+            outs = []
+            for j in range(layer.output_width):
+                m = full
+                for i in range(layer.input_width):
+                    if W[i][j]:
+                        m &= h[i]
+                outs.append(m)
+            h = outs if k2 == last else outs + [~m & full for m in outs]
+        out = 0
+        for j, w in enumerate(self.out_w):
+            if w:
+                out |= h[j]
+        return out
+
+    def backward_packed(self, pd: PackedData, rows: int = None) -> dict:
+        """
+        backward() for every row selected by the `rows` bitmask at once
+        (default: all rows). Returns {weight_id: mask}, where bit r of mask
+        is ∂f/∂w on row r — exactly what backward(pd.rows[r]) would give.
+        Weights whose mask is 0 are omitted. Keys are in backward()'s own
+        canonical order (layers last→first, then i, then j; then outputs).
+
+        This is the same algorithm, just vectorized across rows: every step
+        of backward() (local AND derivatives, re-simulating a flipped signal
+        through the downstream layers) acts on each row independently, so
+        it can act on all rows' bits simultaneously. Re-simulation stays
+        exact — no unsound composition of sensitivities is introduced.
+        """
+        full = pd.full
+        if rows is None:
+            rows = full
+        if pd.n_rows == 0 or rows == 0:
+            return {}
+        last = len(self.layers) - 1
+
+        # Forward with cache
+        aug_inputs, raw_outputs = [], []
+        h = pd.aug_masks
+        for k, layer in enumerate(self.layers):
+            aug_inputs.append(h)
+            W = layer.W
+            outs = []
+            for j in range(layer.output_width):
+                m = full
+                for i in range(layer.input_width):
+                    if W[i][j]:
+                        m &= h[i]
+                outs.append(m)
+            raw_outputs.append(outs)
+            h = outs if k == last else outs + [~m & full for m in outs]
+        h_last = raw_outputs[-1]
+        active = [h_last[j] if self.out_w[j] else 0 for j in range(len(h_last))]
+        final_out, one, two = 0, 0, 0
+        for a in active:              # track "≥1 active" and "≥2 active"
+            two |= one & a
+            one |= a
+        final_out = one
+        not_out = ~final_out & full
+
+        # Output sensitivity of each last-layer neuron (cf. _output_sensitivity)
+        sens = [((active[j] & ~two) | not_out) if self.out_w[j] else 0
+                for j in range(len(h_last))]
+
+        derivs = {}
+        for k in reversed(range(len(self.layers))):
+            layer = self.layers[k]
+            x_in = aug_inputs[k]
+            W = layer.W
+            n_in = layer.input_width
+            for i in range(n_in):
+                not_xi = ~x_in[i] & full & rows
+                if not not_xi:
+                    continue
+                for j in range(layer.output_width):
+                    s = sens[j] & not_xi
+                    if not s:
+                        continue
+                    # all required inputs except i are 1 — if i isn't
+                    # required, that's just neuron j's cached output.
+                    if W[i][j]:
+                        m = full
+                        for i2 in range(n_in):
+                            if i2 != i and W[i2][j]:
+                                m &= x_in[i2]
+                    else:
+                        m = raw_outputs[k][j]
+                    d = s & m
+                    if d:
+                        derivs[('layer', k, i, j)] = d
+            if k > 0:
+                # Sensitivity w.r.t. previous layer's raw outputs: flip
+                # signal p (and its complement) on every row, re-simulate.
+                m_prev = self.layer_widths[k - 1]
+                new_sens = []
+                for p in range(m_prev):
+                    mod = list(x_in)
+                    mod[p] ^= full
+                    mod[p + m_prev] ^= full
+                    new_sens.append(
+                        self._forward_packed_from(k, mod, full) ^ final_out)
+                sens = new_sens
+
+        # Output gate derivatives: f(out_w[j]=1) XOR f(out_w[j]=0)
+        L = len(h_last)
+        for j in range(L):
+            others = 0
+            for j2 in range(L):
+                if j2 != j:
+                    others |= active[j2]
+            d = h_last[j] & ~others & rows
+            if d:
+                derivs[('out', j)] = d
+        return derivs
+
     # ── Weight enumeration (used by fallback strategies) ────────────────────
 
     def all_weight_ids(self):
@@ -447,11 +658,20 @@ class BooleanNetwork:
 # Loss and fallback scoring (used only for pair/perturbation search)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def compute_loss(net: BooleanNetwork, data: dict) -> int:
-    return sum(net(x) != y for x, y in data.items())
+def compute_loss(net: BooleanNetwork, data) -> int:
+    """Number of misclassified rows. `data` may be a dict or a PackedData;
+    pass a PackedData when calling repeatedly on the same data (train()
+    does) to avoid re-packing each time."""
+    pd = as_packed(data)
+    return ((net.forward_packed(pd) ^ pd.y_mask) & pd.full).bit_count()
 
 
-def compute_objective(net: BooleanNetwork, data: dict, lam: float = 0.0):
+def error_mask(net: BooleanNetwork, pd: PackedData) -> int:
+    """Bitmask of misclassified rows."""
+    return (net.forward_packed(pd) ^ pd.y_mask) & pd.full
+
+
+def compute_objective(net: BooleanNetwork, data, lam: float = 0.0):
     """
     Regularized training objective:
 
@@ -505,6 +725,7 @@ def prune(net: BooleanNetwork, data: dict, lam: float, verbose: bool = False) ->
     """
     if lam <= 0:
         return 0
+    data = as_packed(data)
     removed = 0
     while True:
         best_wid, best_score = None, 0
@@ -566,6 +787,7 @@ def train(
     """
     rng = random.Random(seed)
     best_state, best_obj = None, float('inf')
+    packed = as_packed(train_data)   # pack once; all loss evals use it
     MAX_STUCK = 5
     n_train = len(train_data)
     stuck_counter = 0
@@ -579,12 +801,12 @@ def train(
         print(f"{'='*64}")
 
     for step in range(1, max_steps + 1):
-        loss = compute_loss(net, train_data)
+        loss = compute_loss(net, packed)
         if verbose:
             reg = f"  |  active weights {net.complexity()}" if lam else ""
             print(f"\nStep {step:>4}  |  Loss {loss}/{n_train}{reg}")
         if lam:
-            obj = compute_objective(net, train_data, lam)
+            obj = compute_objective(net, packed, lam)
             if obj < best_obj:
                 best_obj, best_state = obj, net.get_state()
 
@@ -594,15 +816,21 @@ def train(
             break
 
         # Collect all misclassified rows
-        error_rows = [x for x, y in train_data.items() if net(x) != y]
+        error_rows = packed.rows_in(error_mask(net, packed))  # used by pair search
 
         # ── 1. Single‑flip candidates via backprop ─────────────────
-        weight_votes = {}          # wid -> number of error rows where derivative=1
-        for x in error_rows:
-            derivs = net.backward(x)
-            for wid, d in derivs.items():
-                if d == 1:
-                    weight_votes[wid] = weight_votes.get(wid, 0) + 1
+        # One bit-packed backward pass over all error rows at once: each
+        # weight gets a mask of the error rows where its derivative is 1.
+        err = error_mask(net, packed)
+        deriv_masks = net.backward_packed(packed, err)
+        # wid -> number of error rows where derivative=1. Inserted in the
+        # same order the old per-row loop used (by first error row where the
+        # derivative is 1, then canonical weight order) so that tie-breaks
+        # in the stable sort below are unchanged.
+        weight_votes = {
+            wid: m.bit_count() for wid, m in
+            sorted(deriv_masks.items(), key=lambda kv: (kv[1] & -kv[1]))
+        }
 
         # Only consider candidates that don't introduce a contradiction, and
         # verify each against the FULL dataset (not just the error rows that
@@ -615,7 +843,7 @@ def train(
         )
         best_wid, best_net_score = None, 0
         for wid in safe_candidates:
-            score = _score_single_flip(net, train_data, wid, lam)
+            score = _score_single_flip(net, packed, wid, lam)
             if score > best_net_score:
                 best_net_score, best_wid = score, wid
 
@@ -630,13 +858,10 @@ def train(
         if verbose:
             print("         No beneficial single flip — searching pairs...")
 
-        # Find active weights (those with derivative=1 on any error row)
-        active_wids = set()
-        for x in error_rows:
-            derivs = net.backward(x)
-            for wid, d in derivs.items():
-                if d == 1:
-                    active_wids.add(wid)
+        # Active weights (derivative=1 on any error row). The net hasn't
+        # changed since step 1, so the masks from that backward pass are
+        # still valid — no need to recompute.
+        active_wids = set(deriv_masks)
         if not active_wids:
             active_wids = set(all_wids)   # fallback to all weights
 
@@ -668,7 +893,7 @@ def train(
                     pair_candidates.append((wa, wb))
 
         if pair_candidates:
-            pair_scores = {pair: _score_pair_flip(net, train_data, pair[0], pair[1], lam)
+            pair_scores = {pair: _score_pair_flip(net, packed, pair[0], pair[1], lam)
                            for pair in pair_candidates}
             best_pair = max(pair_scores, key=pair_scores.get)
             best_pair_score = pair_scores[best_pair]
@@ -718,12 +943,12 @@ def train(
             print(f"\n  ✗ Did not converge within {max_steps} steps.")
 
     if lam:
-        if compute_objective(net, train_data, lam) > best_obj:
+        if compute_objective(net, packed, lam) > best_obj:
             net.set_state(best_state)
-        n_removed = prune(net, train_data, lam, verbose=verbose)
+        n_removed = prune(net, packed, lam, verbose=verbose)
         if verbose:
             print(f"  Pruned {n_removed} weight(s) → {net.complexity()} active, "
-                  f"loss {compute_loss(net, train_data)}/{n_train}")
+                  f"loss {compute_loss(net, packed)}/{n_train}")
     return net
 
 
