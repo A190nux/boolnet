@@ -671,51 +671,129 @@ def error_mask(net: BooleanNetwork, pd: PackedData) -> int:
     return (net.forward_packed(pd) ^ pd.y_mask) & pd.full
 
 
-def compute_objective(net: BooleanNetwork, data, lam: float = 0.0):
+def influence_rows(n_inputs: int, max_rows: int = 4096, seed: int = 0) -> PackedData:
     """
-    Regularized training objective:
-
-        objective = training_errors + lam × (number of active weights)
-
-    With lam == 0 this is exactly compute_loss (an int). For a *single*
-    flip with 0 < lam < 1, fixing an error always outweighs the ±1 change
-    in complexity, so step-by-step the penalty acts as a tie-breaker. But
-    whole networks are compared too (best-state restore in train(), restart
-    selection in train_with_restarts), and there any lam > 0 will accept
-    one extra training error in exchange for more than 1/lam fewer weights.
-    Measured (README Step 13): lam=0.1 kept 100% train accuracy while
-    shrinking nets 3-8×; lam=0.5 started giving up training rows.
+    Rows on which total influence is measured: the full 2^n domain when it
+    has at most max_rows rows, otherwise a fixed random sample (seeded, so
+    the objective is deterministic). Labels are unused.
     """
-    loss = compute_loss(net, data)
-    if lam == 0:
-        return loss
-    return loss + lam * net.complexity()
+    if 2 ** n_inputs <= max_rows:
+        rows = all_inputs(n_inputs)
+    else:
+        rng = random.Random(seed)
+        rows = list({tuple(rng.randint(0, 1) for _ in range(n_inputs))
+                     for _ in range(max_rows)})
+        rows.sort()
+    return PackedData({x: 0 for x in rows})
 
 
-def _score_pair_flip(net, data, wid_a, wid_b, lam=0.0):
-    old = compute_objective(net, data, lam)
+def total_influence(net: BooleanNetwork, pd: PackedData) -> float:
+    """
+    Total influence (average sensitivity) of the network's function:
+
+        I(f) = E_x [ #{ i : f(x) ≠ f(x ⊕ e_i) } ]  ∈ [0, n]
+
+    i.e. the expected number of input bits whose flip changes the output —
+    the Boolean derivative ∂f/∂x_i, averaged over inputs and summed over
+    variables. It's the Boolean analogue of a smoothness / Lipschitz
+    penalty: 0 for a constant, n for parity, about 1.9 for 5-input majority.
+
+    Bit-packed, flipping x_i on every row at once is just swapping the
+    masks of x_i and ¬x_i in the augmented input, so this costs n+1 packed
+    forward passes.
+    """
+    if pd.n_rows == 0:
+        return 0.0
+    base = net.forward_packed(pd)
+    n = net.n_inputs
+    aug = pd.aug_masks
+    total = 0
+    for i in range(n):
+        mod = list(aug)
+        mod[i], mod[i + n] = mod[i + n], mod[i]
+        total += (net._forward_packed_from(0, mod, pd.full) ^ base).bit_count()
+    return total / pd.n_rows
+
+
+class Objective:
+    """
+    Regularized training objective, as a callable net → number:
+
+        objective = training_errors
+                  + lam × (number of active weights)      (Step 13)
+                  + mu  × total_influence(f)              (Step 15)
+
+    With lam == mu == 0 it returns exactly compute_loss (an int), so the
+    unregularized training path is unchanged.
+
+    About lam: for a *single* flip with 0 < lam < 1, fixing an error always
+    outweighs the ±1 change in complexity, so step-by-step the weight
+    penalty acts as a tie-breaker. But whole networks are compared too
+    (best-state restore in train(), restart selection in
+    train_with_restarts), and there any lam > 0 will accept one extra
+    training error in exchange for more than 1/lam fewer weights.
+
+    About mu: influence is measured on ALL inputs (or a large sample — see
+    influence_rows), not just training rows, so it constrains how the
+    function behaves on unseen inputs — that's the point.
+    """
+
+    def __init__(self, data, lam: float = 0.0, mu: float = 0.0,
+                 n_inputs: int = None):
+        self.pd = as_packed(data)
+        self.lam = lam
+        self.mu = mu
+        self._n_inputs = n_inputs
+        self._infl_pd = None
+
+    @property
+    def regularized(self) -> bool:
+        return bool(self.lam or self.mu)
+
+    def influence(self, net) -> float:
+        if self._infl_pd is None:
+            self._infl_pd = influence_rows(self._n_inputs or net.n_inputs)
+        return total_influence(net, self._infl_pd)
+
+    def __call__(self, net) -> float:
+        v = compute_loss(net, self.pd)
+        if self.lam:
+            v += self.lam * net.complexity()
+        if self.mu:
+            v += self.mu * self.influence(net)
+        return v
+
+
+def compute_objective(net: BooleanNetwork, data, lam: float = 0.0,
+                      mu: float = 0.0):
+    """One-off evaluation of the regularized objective (see Objective)."""
+    return Objective(data, lam, mu)(net)
+
+
+def _score_pair_flip(net, objective, wid_a, wid_b):
+    old = objective(net)
     net.flip_weight(wid_a)
     net.flip_weight(wid_b)
-    new = compute_objective(net, data, lam)
+    new = objective(net)
     net.flip_weight(wid_b)
     net.flip_weight(wid_a)
     return old - new
 
 
-def _score_single_flip(net, data, wid, lam=0.0):
+def _score_single_flip(net, objective, wid):
     """Net objective reduction (old - new) from applying a single flip, over
     the FULL dataset — not just the error rows that voted for it. A flip that
     fixes some error rows can simultaneously break rows that were already
-    correct; this is what actually decides whether the flip helps. With
-    lam > 0 the change in active-weight count is included too."""
-    old = compute_objective(net, data, lam)
+    correct; this is what actually decides whether the flip helps. When the
+    objective is regularized, the change in penalty is included too."""
+    old = objective(net)
     net.flip_weight(wid)
-    new = compute_objective(net, data, lam)
+    new = objective(net)
     net.flip_weight(wid)
     return old - new
 
 
-def prune(net: BooleanNetwork, data: dict, lam: float, verbose: bool = False) -> int:
+def prune(net: BooleanNetwork, data, lam: float, verbose: bool = False) -> int:
     """
     Greedy Boolean Occam's razor: repeatedly remove the active weight whose
     removal most reduces the regularized objective, until no removal helps.
@@ -725,20 +803,47 @@ def prune(net: BooleanNetwork, data: dict, lam: float, verbose: bool = False) ->
     """
     if lam <= 0:
         return 0
-    data = as_packed(data)
+    objective = Objective(data, lam)
     removed = 0
     while True:
         best_wid, best_score = None, 0
         for wid in net.all_weight_ids():      # deterministic order
             if _weight_value(net, wid) != 1:
                 continue
-            score = _score_single_flip(net, data, wid, lam)
+            score = _score_single_flip(net, objective, wid)
             if score > best_score:
                 best_wid, best_score = wid, score
         if best_wid is None:
             return removed
         net.flip_weight(best_wid)
         removed += 1
+        if verbose:
+            _log_flip(net, best_wid, None)
+
+
+def polish(net: BooleanNetwork, objective: Objective, verbose: bool = False) -> int:
+    """
+    Greedy local search over ALL single flips (additions as well as
+    removals), applying the best objective-reducing flip until none helps.
+    prune() only removes weights, which is enough for the weight-count
+    penalty; for the influence penalty adding a literal can just as well be
+    what makes the function smoother. Only contradiction-free flips are
+    considered. Terminates because every applied flip strictly decreases
+    the objective. Returns the number of flips applied.
+    """
+    applied = 0
+    while True:
+        best_wid, best_score = None, 0
+        for wid in net.all_weight_ids():
+            if not net.is_safe_flip(wid):
+                continue
+            score = _score_single_flip(net, objective, wid)
+            if score > best_score:
+                best_wid, best_score = wid, score
+        if best_wid is None:
+            return applied
+        net.flip_weight(best_wid)
+        applied += 1
         if verbose:
             _log_flip(net, best_wid, None)
 
@@ -761,6 +866,7 @@ def train(
     verbose:    bool = True,
     seed:       int  = None,
     lam:        float = 0.0,
+    mu:         float = 0.0,
 ) -> BooleanNetwork:
     """
     Train using Boolean backpropagation.
@@ -784,10 +890,14 @@ def train(
     state seen is restored at the end (a late random perturbation can't
     leave the net worse than its best), and a final prune() pass removes
     every connection that isn't paying for itself.
+
+    `mu` adds the total-influence (smoothness) penalty — see Objective. With
+    mu > 0 the final pass is polish() (any single flip, not just removals).
     """
     rng = random.Random(seed)
     best_state, best_obj = None, float('inf')
     packed = as_packed(train_data)   # pack once; all loss evals use it
+    objective = Objective(packed, lam, mu, n_inputs=net.n_inputs)
     MAX_STUCK = 5
     n_train = len(train_data)
     stuck_counter = 0
@@ -804,9 +914,11 @@ def train(
         loss = compute_loss(net, packed)
         if verbose:
             reg = f"  |  active weights {net.complexity()}" if lam else ""
+            if mu:
+                reg += f"  |  influence {objective.influence(net):.3f}"
             print(f"\nStep {step:>4}  |  Loss {loss}/{n_train}{reg}")
-        if lam:
-            obj = compute_objective(net, packed, lam)
+        if objective.regularized:
+            obj = objective(net)
             if obj < best_obj:
                 best_obj, best_state = obj, net.get_state()
 
@@ -843,7 +955,7 @@ def train(
         )
         best_wid, best_net_score = None, 0
         for wid in safe_candidates:
-            score = _score_single_flip(net, packed, wid, lam)
+            score = _score_single_flip(net, objective, wid)
             if score > best_net_score:
                 best_net_score, best_wid = score, wid
 
@@ -893,7 +1005,7 @@ def train(
                     pair_candidates.append((wa, wb))
 
         if pair_candidates:
-            pair_scores = {pair: _score_pair_flip(net, packed, pair[0], pair[1], lam)
+            pair_scores = {pair: _score_pair_flip(net, objective, pair[0], pair[1])
                            for pair in pair_candidates}
             best_pair = max(pair_scores, key=pair_scores.get)
             best_pair_score = pair_scores[best_pair]
@@ -942,12 +1054,17 @@ def train(
         if verbose:
             print(f"\n  ✗ Did not converge within {max_steps} steps.")
 
-    if lam:
-        if compute_objective(net, packed, lam) > best_obj:
+    if objective.regularized:
+        if objective(net) > best_obj:
             net.set_state(best_state)
-        n_removed = prune(net, packed, lam, verbose=verbose)
+        if mu:
+            n_changed = polish(net, objective, verbose=verbose)
+            what = "Polished"
+        else:
+            n_changed = prune(net, packed, lam, verbose=verbose)
+            what = "Pruned"
         if verbose:
-            print(f"  Pruned {n_removed} weight(s) → {net.complexity()} active, "
+            print(f"  {what}: {n_changed} flip(s) → {net.complexity()} active, "
                   f"loss {compute_loss(net, packed)}/{n_train}")
     return net
 
@@ -992,6 +1109,7 @@ def train_with_restarts(
     verbose: bool = True,
     seed: int = None,
     lam: float = 0.0,
+    mu: float = 0.0,
 ) -> BooleanNetwork:
     """
     `seed` controls both the per-restart network initialization AND the
@@ -1004,6 +1122,7 @@ def train_with_restarts(
     restart with the lowest regularized objective is kept.
     """
     rng = random.Random(seed)
+    objective = Objective(train_data, lam, mu, n_inputs=n_inputs)
     best_net = None
     best_loss = float('inf')
     for r in range(1, n_restarts + 1):
@@ -1015,19 +1134,80 @@ def train_with_restarts(
             print(f"{'#'*64}")
         net = BooleanNetwork(n_inputs=n_inputs, layer_widths=layer_widths, seed=net_seed)
         train(net, train_data, max_steps=max_steps, verbose=verbose,
-              seed=train_seed, lam=lam)
-        loss = compute_objective(net, train_data, lam)
+              seed=train_seed, lam=lam, mu=mu)
+        loss = objective(net)
         if verbose:
-            label = "objective" if lam else "loss"
+            label = "objective" if objective.regularized else "loss"
             print(f"  Restart {r} finished with {label} {loss}")
         if loss < best_loss:
             best_loss = loss
             best_net = net
-            if loss == 0 and not lam:
+            if loss == 0 and not objective.regularized:
                 if verbose:
                     print("  ✓ Perfect solution found, stopping restarts.")
                 break
     return best_net
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Ensemble (majority vote over independently trained nets)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class Ensemble:
+    """
+    Majority vote of several networks. Callable like a BooleanNetwork, so
+    evaluate(..., verbose=False) and compute_loss work on it unchanged.
+    Use an odd number of members to avoid ties (a tie predicts 0).
+    """
+
+    def __init__(self, members: list):
+        self.members = members
+
+    def __call__(self, x: tuple) -> int:
+        return int(2 * sum(m(x) for m in self.members) > len(self.members))
+
+    def forward_packed(self, pd: PackedData) -> int:
+        masks = [m.forward_packed(pd) for m in self.members]
+        need = len(masks) // 2 + 1
+        out = 0
+        for r in range(pd.n_rows):
+            bit = 1 << r
+            if sum(1 for m in masks if m & bit) >= need:
+                out |= bit
+        return out
+
+    def complexity(self) -> int:
+        return sum(m.complexity() for m in self.members)
+
+
+def train_ensemble(
+    n_inputs: int,
+    layer_widths: list,
+    train_data: dict,
+    n_members: int = 9,
+    max_steps: int = 500,
+    seed: int = None,
+    lam: float = 0.0,
+    mu: float = 0.0,
+) -> Ensemble:
+    """
+    Train n_members networks independently (one train() run each — no
+    restarts), keep those that reached the lowest objective among them,
+    and return their majority vote.
+    """
+    rng = random.Random(seed)
+    objective = Objective(train_data, lam, mu, n_inputs=n_inputs)
+    trained = []
+    for _ in range(n_members):
+        net = BooleanNetwork(n_inputs, layer_widths, seed=rng.randint(0, 2**31 - 1))
+        train(net, train_data, max_steps=max_steps, verbose=False,
+              seed=rng.randint(0, 2**31 - 1), lam=lam, mu=mu)
+        trained.append((objective(net), net))
+    best = min(o for o, _ in trained)
+    keep = [net for o, net in trained if o == best]
+    if len(keep) % 2 == 0:        # keep it odd: drop the last
+        keep = keep[:-1]
+    return Ensemble(keep)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

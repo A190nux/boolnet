@@ -489,6 +489,41 @@ The λ>0 runs gain the most, because pruning is almost entirely loss evaluations
 
 ---
 
+### Step 15 — A smoothness regularizer, an ensemble, and two baselines (mostly a negative result)
+
+Step 13's weight‑count penalty helped, but it is a crude idea of "simple". This step tested two alternatives, and tuned and confirmed them on separate seeds.
+
+**1. Total influence (`mu`).** `I(f) = E_x[ #{i : f(x) ≠ f(x⊕eᵢ)} ]` is the expected number of input bits whose flip changes the output. It is the Boolean derivative `∂f/∂xᵢ` averaged over inputs and summed over variables: the Boolean version of a smoothness or Lipschitz penalty. It is measured on *all* inputs, not just training rows, so it constrains the network's behavior on unseen rows. Bit‑packed, flipping `xᵢ` on every row at once is just swapping the `xᵢ`/`¬xᵢ` masks, so it costs `n+1` packed forward passes. `train(..., mu=μ)` adds `μ × I(f)` to the objective and finishes with `polish()`, a greedy pass over all safe single flips (additions as well as removals).
+
+**2. Ensemble.** `train_ensemble()` returns the majority vote of 9 independently trained networks.
+
+**3. Live‑weight counting was checked and dropped.** After λ=0.1 training, 30/30 networks had zero weights outside the output's cone of influence: pruning a dead weight never costs an error, so `prune()` already removes them all. Counting only live weights would change nothing.
+
+**Method.** Configs were tuned on seeds 100–119, then the chosen ones were run on fresh seeds 200–219 (new splits and new training seeds). Only the fresh‑seed numbers are quoted below. μ = 0.25, 0.5 and 1.0 gave identical results on the tuning seeds, so μ=0.5 stands in for all of them. A one‑flip change in influence is far too small to outweigh a training error, so in practice μ only acts as a tie‑breaker among networks that fit the data equally well.
+
+**Results** (test accuracy, mean ± standard error over 20 seeds; `test.py` section 5):
+
+```
+                         majority  nearest   none   λ=0.1   μ=0.5   λ=0.1   ensemble(9)
+                         label     neighbour                        +μ=0.5  λ=0.1
+Majority n=5, 75%         41.2      49.4     52.5   55.0    49.4    51.9    53.8   (±2–3)
+Majority n=5, 50%         44.1      58.8     55.9   60.0    53.1    58.1    59.7   (±1–2)
+AtLeastTwo n=5, 50%       82.5      77.5     72.5   71.6    83.1    75.0    71.2   (±1–2)
+AtLeastThree n=6, 50%     65.8      69.4     66.1   70.5    68.6    68.6    69.1   (±1–1.6)
+custom n=4, 50%           48.8      63.1     55.0   71.2    53.1    61.9    65.0   (±3–4.5)
+custom n=4, 75%           55.0      66.2     62.5   87.5    66.2    92.5    87.5   (±4–6)
+```
+
+What this shows:
+
+- **The influence penalty is essentially a "predict the common label" bias.** Its one clear win (AtLeastTwo, 72→83%) only matches the trivial predict‑the‑majority‑label baseline (82.5%). That function is 1 on 26 of 32 inputs. Minimizing influence over the whole domain is cheapest when the unseen region is constant, because a constant region contributes no influence except at its boundary with the training rows. On balanced targets (majority, custom) it pushes learned influence further *below* the target's (e.g. 1.36 vs 1.88) and hurts test accuracy. That makes it the wrong notion of smoothness here, and **not recommended**. The code stays in, tested, as a documented negative result.
+- **λ=0.1 remains the best general default.** It is best or tied for best on 5/6 cases, and it beats nearest neighbour where the target has a small description (custom: 71 vs 63, 87.5 vs 66). λ=0.1+μ=0.5 scored 92.5% on custom 75%, but that is within one standard error of λ=0.1 and worse everywhere else.
+- **The ensemble adds nothing** over a single λ=0.1 network on these sizes. It is kept as a cheap tool.
+- **Nobody learns majority from 16–24 rows.** Every method, including nearest neighbour, is near chance. The majority‑label baseline is even *below* 50%, because when a balanced function is split, the held‑out rows lean toward the label that is rarer in training. Some targets just don't have enough data here.
+- **AND/OR circuits don't beat nearest neighbour across the board.** On AtLeastTwo, both trivial baselines beat every circuit learner. This is the honest bar future changes have to clear.
+
+---
+
 ## How This Compares to Standard (Real‑Valued) Backprop
 
 **Why real backprop is a single, cheap pass.** Differentiation is linear: the multivariate chain rule says a total derivative is a *sum* of path contributions. That linearity is what lets standard backprop cache one local Jacobian per layer during the forward pass, then compose them backward with a single matrix multiply per layer — never touching the raw data again. Cost stays proportional to network size, `O(depth × width²)`, same order as the forward pass.
@@ -520,7 +555,7 @@ Three more scaling dimensions worth separating out:
 |------|-------------|
 | `bool_net.py` | Full multi‑layer Boolean neural network with backpropagation |
 | `tests/test_bool_net.py` | Fast regression tests (~6s): backward exactness vs brute force, convergence, reproducibility, regularization. Run `python3 -m unittest discover -s tests -v` |
-| `test.py` | Slower experiment harness that produces the README's numbers |
+| `test.py` | Slower experiment harness that produces the README's numbers (section 5 uses all CPU cores) |
 | `boolean_learner.py` / `.html` | Earlier single‑layer version |
 
 ### Architecture
@@ -555,6 +590,10 @@ compute_objective(net, data, lam) → errors + lam × active weights
 _score_single_flip(net, data, wid, lam) → true objective delta from a single candidate flip
 _score_pair_flip(net, data, a, b, lam)  → true objective delta from a candidate pair flip
 prune(net, data, lam)          → greedily remove weights that don't pay for themselves
+Objective(data, lam, mu)       → callable net → errors + λ·weights + μ·influence
+total_influence(net, pd)       → average sensitivity Σᵢ Pr[f(x) ≠ f(x⊕eᵢ)] (bit-packed)
+polish(net, objective)         → greedy over all safe single flips (used when mu > 0)
+train_ensemble(...) / Ensemble → majority vote of independently trained nets
 train(net, train_data, ...)    → backprop‑filtered candidates, scored by true loss, with pair/perturbation fallbacks
 train_with_restarts(...)       → multiple seeds, keep best
 evaluate(...)                   → accuracy report
@@ -621,8 +660,7 @@ The one idea here that's specific to Boolean networks in a way real backprop can
 
 ### 3. Boolean regularization ✅ Done (Step 13), follow‑ups remain
 
-The basic penalty works (see Step 13). Open follow‑ups:
-- **Count only live weights:** weights in neurons the output can't see shouldn't count, but `complexity()` currently counts them.
+The basic penalty works (see Step 13). Tried and rejected in Step 15: total‑influence smoothness (it collapses to "predict the common label"), live‑weight counting (no effect: `prune()` already removes dead weights), and majority‑vote ensembles (no gain). Open follow‑ups:
 - **Better pruning:** try pair or swap moves in `prune()` (remove two, add one), not only single removals.
 - **Choose λ by validation** instead of fixing it by hand.
 - **Better inductive biases** for threshold‑like functions, where fewest‑weights alone doesn't help.

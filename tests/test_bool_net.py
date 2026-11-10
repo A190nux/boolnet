@@ -15,8 +15,9 @@ import random
 import unittest
 
 from bool_net import (
-    BooleanNetwork, PackedData, all_inputs, compute_loss, compute_objective,
-    error_mask, make_dataset,
+    BooleanNetwork, Ensemble, Objective, PackedData, all_inputs, compute_loss,
+    compute_objective, error_mask, influence_rows, make_dataset, polish,
+    total_influence, train_ensemble,
     majority, parity, prune, train, train_with_restarts, xor2, custom,
 )
 
@@ -246,6 +247,94 @@ class TestRegularization(unittest.TestCase):
         fp = weights_fingerprint(net)
         prune(net, data, lam=0.0)          # lam=0 must be a no-op
         self.assertEqual(weights_fingerprint(net), fp)
+
+
+def brute_influence(net, n):
+    rows = all_inputs(n)
+    flips = sum(net(x) != net(x[:i] + (1 - x[i],) + x[i+1:])
+                for x in rows for i in range(n))
+    return flips / len(rows)
+
+
+class TestInfluence(unittest.TestCase):
+
+    def test_packed_influence_matches_brute_force(self):
+        rng = random.Random(55)
+        for n, widths in [(2, [3]), (3, [4, 4]), (4, [5, 3, 2]), (7, [6, 4])]:
+            pd = influence_rows(n)
+            self.assertEqual(pd.n_rows, 2 ** n)
+            for _ in range(15):
+                net = random_net(rng, n, widths)
+                self.assertAlmostEqual(total_influence(net, pd),
+                                       brute_influence(net, n))
+
+    def test_constant_function_has_zero_influence(self):
+        net = BooleanNetwork(4, [4], seed=0)
+        net.out_w = [0] * 4                     # output is constantly 0
+        self.assertEqual(total_influence(net, influence_rows(4)), 0.0)
+
+    def test_sampled_rows_for_large_n(self):
+        pd = influence_rows(14, max_rows=500, seed=1)
+        self.assertLessEqual(pd.n_rows, 500)
+        self.assertEqual(pd.rows, influence_rows(14, max_rows=500, seed=1).rows)
+
+    def test_objective_terms(self):
+        data, _ = make_dataset(4, majority, observed_fraction=0.75, seed=0)
+        net = BooleanNetwork(4, [4, 4], seed=3)
+        loss = compute_loss(net, data)
+        self.assertEqual(Objective(data)(net), loss)
+        self.assertIsInstance(Objective(data)(net), int)
+        self.assertAlmostEqual(
+            compute_objective(net, data, lam=0.1, mu=0.5),
+            loss + 0.1 * net.complexity() + 0.5 * brute_influence(net, 4))
+
+    def test_polish_is_monotone_safe_and_locally_optimal(self):
+        data, _ = make_dataset(4, majority, observed_fraction=0.5, seed=2)
+        for seed in range(3):
+            net = BooleanNetwork(4, [4, 4], seed=seed)
+            obj = Objective(data, lam=0.05, mu=0.5)
+            before = obj(net)
+            polish(net, obj)
+            after = obj(net)
+            self.assertLessEqual(after, before)
+            self.assertFalse(net.has_contradiction())
+            for wid in list(net.all_weight_ids()):
+                if net.is_safe_flip(wid):
+                    net.flip_weight(wid)
+                    self.assertGreaterEqual(obj(net), after - 1e-12, wid)
+                    net.flip_weight(wid)
+
+    def test_influence_training_never_worse_than_init(self):
+        data, _ = make_dataset(5, majority, observed_fraction=0.5, seed=4)
+        for seed in range(3):
+            net = BooleanNetwork(5, [8, 4], seed=seed)
+            obj = Objective(data, mu=0.5)
+            start = obj(net)
+            train(net, data, verbose=False, seed=seed, mu=0.5)
+            self.assertLessEqual(obj(net), start)
+            self.assertFalse(net.has_contradiction())
+
+
+class TestEnsemble(unittest.TestCase):
+
+    def test_vote_and_packed_vote_agree(self):
+        rng = random.Random(9)
+        members = [random_net(rng, 4, [4, 4]) for _ in range(5)]
+        ens = Ensemble(members)
+        pd = influence_rows(4)
+        out = ens.forward_packed(pd)
+        for r, x in enumerate(pd.rows):
+            votes = sum(m(x) for m in members)
+            self.assertEqual(ens(x), int(votes >= 3))
+            self.assertEqual((out >> r) & 1, ens(x))
+
+    def test_train_ensemble_is_odd_and_reproducible(self):
+        data, _ = make_dataset(4, custom, observed_fraction=0.75, seed=0)
+        a = train_ensemble(4, [4, 4], data, n_members=5, seed=3)
+        b = train_ensemble(4, [4, 4], data, n_members=5, seed=3)
+        self.assertEqual(len(a.members) % 2, 1)
+        self.assertEqual([weights_fingerprint(m) for m in a.members],
+                         [weights_fingerprint(m) for m in b.members])
 
 
 class TestDataset(unittest.TestCase):

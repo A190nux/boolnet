@@ -1,5 +1,5 @@
 """
-test.py — Four investigations, each producing numbers to fold back into the README:
+test.py — Five investigations, each producing numbers to fold back into the README:
 
   1. Rerun XOR(n=2) and Parity(n=3) convergence stats with real, reproducible seeds
      (replaces old convergence claims with numbers from THIS run).
@@ -8,6 +8,7 @@ test.py — Four investigations, each producing numbers to fold back into the RE
   3. Probe whether layer_widths=[4,4] can represent 4-input parity exactly, or
      whether it needs more restarts / a wider config.
   4. Measure whether Boolean regularization (lam > 0) improves test accuracy.
+  5. Compare regularizers: weight count, total influence, ensembles.
 
 Fast correctness tests live in tests/ (python3 -m unittest discover -s tests).
 
@@ -237,8 +238,144 @@ def run_regularization_section(n_seeds=8, lams=(0.0, 0.1, 0.5)):
     print()
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 5. Regularizer comparison: weights vs influence vs ensemble
+# ─────────────────────────────────────────────────────────────────────────────
+
+def at_least_three(x): return int(sum(x) >= 3)
+
+REG_CASES = [
+    ("Majority n=5, 75%",    5, majority,       [8, 4], 0.75),
+    ("Majority n=5, 50%",    5, majority,       [8, 4], 0.50),
+    ("AtLeastTwo n=5, 50%",  5, at_least_two,   [8, 4], 0.50),
+    ("AtLeastThree n=6, 50%", 6, at_least_three, [8, 4], 0.50),
+    ("custom n=4, 50%",      4, custom,         [4, 4], 0.50),
+    ("custom n=4, 75%",      4, custom,         [4, 4], 0.75),
+]
+
+
+def _reg_job(job):
+    """One (case, config, seed) run — top-level so multiprocessing can pickle it."""
+    case_i, cfg, seed = job
+    _, n, fn, widths, frac = REG_CASES[case_i]
+    kind, lam, mu = cfg
+    train_data, test_data = make_dataset(n, fn, observed_fraction=frac, seed=seed)
+    if kind in BASELINES:
+        net = BASELINES[kind](train_data)
+        tr, te = evaluate(net, train_data, test_data, verbose=False)
+        return case_i, cfg, tr, te, None
+    if kind == "ensemble":
+        net = train_ensemble(n, widths, train_data, n_members=9, seed=seed,
+                             lam=lam, mu=mu)
+        infl = None
+    else:
+        net = train_with_restarts(n, widths, train_data, n_restarts=5,
+                                  verbose=False, seed=seed, lam=lam, mu=mu)
+        infl = total_influence(net, influence_rows(n))
+    tr, te = evaluate(net, train_data, test_data, verbose=False)
+    return case_i, cfg, tr, te, infl
+
+
+def regularizer_comparison(configs, seeds, processes=None):
+    """Mean train/test accuracy (± standard error over seeds) per case and config."""
+    from multiprocessing import Pool
+    jobs = [(c, cfg, s) for c in range(len(REG_CASES)) for cfg in configs for s in seeds]
+    with Pool(processes) as pool:
+        results = pool.map(_reg_job, jobs, chunksize=1)
+    table = {}
+    for c, cfg, tr, te, infl in results:
+        table.setdefault((c, cfg), []).append((tr, te, infl))
+    for c, (desc, n, fn, _, _) in enumerate(REG_CASES):
+        true_infl = total_influence_of(fn, n)
+        print(f"  {desc}   (target influence {true_infl:.2f})")
+        for cfg in configs:
+            rows = table[(c, cfg)]
+            tes = [r[1] for r in rows]
+            mean = sum(tes) / len(tes)
+            se = (sum((t - mean) ** 2 for t in tes) / (len(tes) - 1)) ** 0.5 / len(tes) ** 0.5
+            tr = sum(r[0] for r in rows) / len(rows)
+            infls = [r[2] for r in rows if r[2] is not None]
+            infl = f"{sum(infls)/len(infls):.2f}" if infls else "  - "
+            print(f"    {cfg_name(cfg):22s} train {100*tr:5.1f}%   "
+                  f"test {100*mean:5.1f}% ± {100*se:4.1f}   influence {infl}")
+    return table
+
+
+class _MajorityLabel:
+    """Baseline: always predict the most common training label."""
+    def __init__(self, data):
+        self.y = int(2 * sum(data.values()) > len(data))
+    def __call__(self, x):
+        return self.y
+
+
+class _NearestNeighbour:
+    """Baseline: label of the nearest training row in Hamming distance
+    (majority vote among equally near rows, ties → most common label)."""
+    def __init__(self, data):
+        self.data = data
+        self.default = _MajorityLabel(data).y
+    def __call__(self, x):
+        if x in self.data:
+            return self.data[x]
+        best, votes = None, []
+        for xt, y in self.data.items():
+            d = sum(a != b for a, b in zip(x, xt))
+            if best is None or d < best:
+                best, votes = d, [y]
+            elif d == best:
+                votes.append(y)
+        s = 2 * sum(votes)
+        return 1 if s > len(votes) else 0 if s < len(votes) else self.default
+
+
+BASELINES = {"const": _MajorityLabel, "1nn": _NearestNeighbour}
+
+
+def cfg_name(cfg):
+    kind, lam, mu = cfg
+    if kind == "const":
+        return "baseline: majority label"
+    if kind == "1nn":
+        return "baseline: nearest nbr"
+    parts = [p for p in (f"λ={lam}" if lam else "", f"μ={mu}" if mu else "") if p]
+    label = " ".join(parts) or "none"
+    return f"ensemble(9) {label}" if kind == "ensemble" else label
+
+
+def total_influence_of(fn, n):
+    """Influence of the true target function (reference point)."""
+    rows = all_inputs(n)
+    flips = sum(fn(x) != fn(x[:i] + (1 - x[i],) + x[i+1:]) for x in rows for i in range(n))
+    return flips / len(rows)
+
+
+def run_regularizer_section():
+    print("=" * 78)
+    print("5. REGULARIZERS: weight count vs total influence vs ensemble")
+    print("=" * 78)
+    configs = [("single", 0.0, 0.0), ("single", 0.1, 0.0),
+               ("single", 0.0, 0.25), ("single", 0.0, 0.5), ("single", 0.0, 1.0),
+               ("single", 0.0, 2.0), ("single", 0.1, 0.5),
+               ("ensemble", 0.1, 0.0)]
+    print("  Tuning seeds 100-119:")
+    regularizer_comparison(configs, range(100, 120))
+    print()
+    # Configs chosen from the tuning run (mu values 0.25-1.0 were identical
+    # there, so one stands in for all), plus two trivial baselines, on
+    # FRESH seeds — these are the numbers to quote.
+    confirm = [("const", 0, 0), ("1nn", 0, 0),
+               ("single", 0.0, 0.0), ("single", 0.1, 0.0),
+               ("single", 0.0, 0.5), ("single", 0.1, 0.5),
+               ("ensemble", 0.1, 0.0)]
+    print("  Confirmation seeds 200-219 (fresh splits and training seeds):")
+    regularizer_comparison(confirm, range(200, 220))
+    print()
+
+
 if __name__ == "__main__":
     run_convergence_section()
     run_complexity_section()
     run_representability_section()
     run_regularization_section()
+    run_regularizer_section()
