@@ -885,11 +885,11 @@ def train(
     behaves as before and draws from OS entropy, differing run to run.
 
     `lam` is the Boolean regularization strength (see compute_objective).
-    With lam == 0 (default) training is unchanged. With lam > 0, candidate
-    flips are scored by the regularized objective, the lowest-objective
-    state seen is restored at the end (a late random perturbation can't
-    leave the net worse than its best), and a final prune() pass removes
-    every connection that isn't paying for itself.
+    The lowest-loss (or lowest-objective) state seen is always restored at
+    the end, so a late random perturbation can't leave the net worse than
+    its best. With lam > 0, candidate flips are also scored by the
+    regularized objective, and a final prune() pass removes every
+    connection that isn't paying for itself.
 
     `mu` adds the total-influence (smoothness) penalty — see Objective. With
     mu > 0 the final pass is polish() (any single flip, not just removals).
@@ -917,10 +917,13 @@ def train(
             if mu:
                 reg += f"  |  influence {objective.influence(net):.3f}"
             print(f"\nStep {step:>4}  |  Loss {loss}/{n_train}{reg}")
-        if objective.regularized:
-            obj = objective(net)
-            if obj < best_obj:
-                best_obj, best_state = obj, net.get_state()
+        # Track the best state seen (by loss, or by the regularized
+        # objective). Without this, a run that never reaches zero loss
+        # returns whatever state it ended in — often right after a random
+        # perturbation made things worse (README Step 16).
+        obj = objective(net) if objective.regularized else loss
+        if obj < best_obj:
+            best_obj, best_state = obj, net.get_state()
 
         if loss == 0:
             if verbose:
@@ -1054,9 +1057,10 @@ def train(
         if verbose:
             print(f"\n  ✗ Did not converge within {max_steps} steps.")
 
+    final_obj = objective(net) if objective.regularized else compute_loss(net, packed)
+    if final_obj > best_obj:
+        net.set_state(best_state)
     if objective.regularized:
-        if objective(net) > best_obj:
-            net.set_state(best_state)
         if mu:
             n_changed = polish(net, objective, verbose=verbose)
             what = "Polished"

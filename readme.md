@@ -509,7 +509,7 @@ Step 13's weight‑count penalty helped, but it is a crude idea of "simple". Thi
 Majority n=5, 75%         41.2      49.4     52.5   55.0    49.4    51.9    53.8   (±2–3)
 Majority n=5, 50%         44.1      58.8     55.9   60.0    53.1    58.1    59.7   (±1–2)
 AtLeastTwo n=5, 50%       82.5      77.5     72.5   71.6    83.1    75.0    71.2   (±1–2)
-AtLeastThree n=6, 50%     65.8      69.4     66.1   70.5    68.6    68.6    69.1   (±1–1.6)
+AtLeastThree n=6, 50%     65.8      69.4     65.9   70.5    68.6    68.6    69.1   (±1–1.6)
 custom n=4, 50%           48.8      63.1     55.0   71.2    53.1    61.9    65.0   (±3–4.5)
 custom n=4, 75%           55.0      66.2     62.5   87.5    66.2    92.5    87.5   (±4–6)
 ```
@@ -521,6 +521,56 @@ What this shows:
 - **The ensemble adds nothing** over a single λ=0.1 network on these sizes. It is kept as a cheap tool.
 - **Nobody learns majority from 16–24 rows.** Every method, including nearest neighbour, is near chance. The majority‑label baseline is even *below* 50%, because when a balanced function is split, the held‑out rows lean toward the label that is rarer in training. Some targets just don't have enough data here.
 - **AND/OR circuits don't beat nearest neighbour across the board.** On AtLeastTwo, both trivial baselines beat every circuit learner. This is the honest bar future changes have to clear.
+
+---
+
+### Step 16 — A real dataset: the MONK's problems
+
+Toy truth tables can only say so much. The MONK's problems (Thrun et al., 1991; UCI ML Repository, CC BY 4.0) are the classic benchmark for exactly this kind of learner. There are 6 categorical attributes (432 possible inputs), each problem has a fixed official train/test split, and the test set is the entire domain. `datasets.py` one‑hot encodes the attributes into **17 Boolean inputs** (34 after complement augmentation), far more than anything trained so far. A test checks the loaded labels against the documented target concepts:
+
+```
+MONK-1: (a1 = a2) or (a5 = 1)                          → a 4-term DNF over the one-hot bits
+MONK-2: exactly two of {a1..a6} equal 1                → threshold-like, like majority
+MONK-3: (a5 = 3 and a4 = 1) or (a5 ≠ 4 and a2 ≠ 3)     → 2-term DNF, 5% label noise in train
+```
+
+The baselines are in `baselines.py`, with no sklearn dependency. The decision tree is an ID3‑style binary tree over the one‑hot bits; it is not the multiway ID3 used in the original 1991 comparison, so published ID3 figures don't transfer.
+
+**Results** (`test.py` section 6). BoolNet uses `train_with_restarts(n_restarts=5)` over 10 training seeds and shows mean ± standard error (and the best seed). The baselines are deterministic.
+
+```
+                      majority  nearest   decision   BoolNet [8,4]              BoolNet [12,6]
+                      label     neighbour tree       λ=0          λ=0.1         λ=0.1
+MONK-1        train    50.0     100       100        79.8         92.7          93.0
+              test     50.0      83.8      92.6      76.9 ± 5.8   88.8 ± 2.9    86.5 ± 2.7   (best: 100)
+MONK-2        train    62.1     100       100        65.0         75.4          77.4
+              test     67.1      72.2      86.6      67.2 ± 0.4   66.5 ± 0.8    67.8 ± 0.8
+MONK-3        train    50.8     100       100        80.3         94.7          93.2
+(noisy)       test     47.2      87.5      89.8      80.3 ± 7.0   96.6 ± 0.8    93.8 ± 2.3   (best: 100)
+```
+
+What this shows:
+
+- **MONK-3 is a genuine win.** At 96.6% ± 0.8, BoolNet beats both the tree (89.8%) and nearest neighbour (87.5%) by a margin well outside the error bar. Its ~95% training accuracy is what you'd hope for with 5% label noise: it mostly *declines to memorize* the 6 noisy rows that the tree and nearest neighbour fit exactly.
+- **MONK-1 is limited by the search, not the model.** Individual seeds reach 100% test accuracy, which is the exact concept, but training accuracy averages 93%. The search often fails to fit the training data at all, even though a small network that fits it perfectly exists. The tree's 92.6% is ahead of the mean.
+- **MONK-2 fails, like majority did.** BoolNet stays at the 67% you get from always predicting the common label and can't even fit the training data. "Exactly two of six" has no compact AND‑of‑ANDs form.
+- **Wider is worse and 6–8× slower.** `[12,6]` searches a bigger space and does no better than `[8,4]` on any problem.
+
+**A fix along the way: `train()` now always returns its best state.** Previously, with λ=0, a run that never reached zero loss returned whatever state it ended in, often right after a random perturbation had made things worse. It now restores the lowest‑loss state it saw. A test pins this down by recording the loss at every step: the old code fails it (seed 2 ended at 18 errors after having reached 16). Runs that reach zero loss were never affected, so every convergence count in this README is unchanged. Re‑running Steps 13 and 15 changed a single cell, by 0.2 points.
+
+**Correcting the first hypothesis.** λ=0.1's big training‑accuracy advantage on MONK's (93% vs 80%) is **not** from that best‑state restore: the restore alone moved λ=0 from 77.4% to 79.8% training. λ=1e‑9 reproduces λ=0.1's numbers exactly, so the weight penalty's size doesn't matter. By elimination, the cause is how flips are scored:
+
+- The restore now applies to both settings.
+- Both run every restart, since neither reaches zero loss.
+- The final prune can't raise training error.
+
+With λ > 0, a flip that changes no training row's prediction but removes a weight scores +λ instead of 0, so it's accepted as progress. With λ = 0 the search sees no improving flip, counts itself stuck, falls back to random perturbations, and gives up after 5. So on MONK's the penalty matters less as an Occam prior than as **a way for the search to keep moving when the error count is flat**. This has not been isolated by a direct experiment yet.
+
+**What this points to next:** the search, not the objective. Seeds that reach 100% on MONK-1 exist, but the search finds them unreliably, and bigger networks make it worse. Candidate directions:
+- deliberate neutral moves (accept zero‑change flips, with a tabu list to avoid cycling);
+- a smarter escape than random perturbation;
+- more restarts now that each one is cheap;
+- the pair‑search speedup from Step 14, which these 34‑input layers make much more pressing.
 
 ---
 
@@ -556,6 +606,10 @@ Three more scaling dimensions worth separating out:
 | `bool_net.py` | Full multi‑layer Boolean neural network with backpropagation |
 | `tests/test_bool_net.py` | Fast regression tests (~6s): backward exactness vs brute force, convergence, reproducibility, regularization. Run `python3 -m unittest discover -s tests -v` |
 | `test.py` | Slower experiment harness that produces the README's numbers (section 5 uses all CPU cores) |
+| `datasets.py` | Loader for the MONK's problems (official splits, one‑hot encoded to 17 bits) |
+| `baselines.py` | Reference learners: majority label, Hamming nearest neighbour, ID3‑style decision tree |
+| `data/monks/` | MONK's problems as downloaded from the UCI ML Repository (CC BY 4.0) |
+| `tests/test_datasets_baselines.py` | Loader checked against the documented target concepts; baseline sanity tests |
 | `boolean_learner.py` / `.html` | Earlier single‑layer version |
 
 ### Architecture

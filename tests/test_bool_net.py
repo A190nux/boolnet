@@ -168,6 +168,36 @@ class TestTraining(unittest.TestCase):
             fps.add(weights_fingerprint(net))
         self.assertEqual(len(fps), 1)
 
+    def test_unconverged_training_returns_best_state(self):
+        """A run that never reaches zero loss must return the best state it
+        committed to, not whatever state the last random perturbation left
+        behind. train() calls error_mask() exactly once per step, on the
+        committed state (never on probe flips), so wrapping it records the
+        loss trajectory."""
+        import bool_net
+        rng = random.Random(3)
+        data = {x: rng.randint(0, 1) for x in all_inputs(6)}   # random labels
+        original = bool_net.error_mask
+        caught_a_late_regression = False
+        try:
+            for seed in range(20):
+                seen = []
+                def recording(net, pd, _seen=seen):
+                    m = original(net, pd)
+                    _seen.append(m.bit_count())
+                    return m
+                bool_net.error_mask = recording
+                net = BooleanNetwork(6, [3], seed=seed)          # too small to fit
+                train(net, data, max_steps=200, verbose=False, seed=seed)
+                bool_net.error_mask = original
+                final = compute_loss(net, data)
+                self.assertEqual(final, min(seen), f"seed={seed}")
+                caught_a_late_regression |= seen[-1] > min(seen)
+        finally:
+            bool_net.error_mask = original
+        # Make sure the scenario actually exercises the fix.
+        self.assertTrue(caught_a_late_regression)
+
     def test_no_contradictions_after_training(self):
         data, _ = make_dataset(3, parity, observed_fraction=1.0, seed=0)
         for seed in range(10):

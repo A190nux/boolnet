@@ -1,5 +1,5 @@
 """
-test.py — Five investigations, each producing numbers to fold back into the README:
+test.py — Six investigations, each producing numbers to fold back into the README:
 
   1. Rerun XOR(n=2) and Parity(n=3) convergence stats with real, reproducible seeds
      (replaces old convergence claims with numbers from THIS run).
@@ -9,6 +9,7 @@ test.py — Five investigations, each producing numbers to fold back into the RE
      whether it needs more restarts / a wider config.
   4. Measure whether Boolean regularization (lam > 0) improves test accuracy.
   5. Compare regularizers: weight count, total influence, ensembles.
+  6. A real dataset: MONK's problems vs decision tree / nearest-neighbour baselines.
 
 Fast correctness tests live in tests/ (python3 -m unittest discover -s tests).
 
@@ -20,6 +21,8 @@ import random
 import time
 
 from bool_net import *
+from baselines import DecisionTree, MajorityLabel, NearestNeighbour
+from datasets import load_monks
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -276,12 +279,31 @@ def _reg_job(job):
     return case_i, cfg, tr, te, infl
 
 
+def _parallel_map(fn, jobs, processes=None, label="runs"):
+    """Pool map that reports progress on stderr as runs finish (results are
+    returned in job order, so output is still deterministic)."""
+    import sys
+    from multiprocessing import Pool
+    out = [None] * len(jobs)
+    t0 = time.perf_counter()
+    with Pool(processes) as pool:
+        for done, (i, r) in enumerate(pool.imap_unordered(_indexed, [(fn, i, j) for i, j in enumerate(jobs)]), 1):
+            out[i] = r
+            print(f"\r    [{done}/{len(jobs)} {label}, {time.perf_counter() - t0:5.0f}s]",
+                  end="", file=sys.stderr, flush=True)
+    print(file=sys.stderr)
+    return out
+
+
+def _indexed(arg):
+    fn, i, job = arg
+    return i, fn(job)
+
+
 def regularizer_comparison(configs, seeds, processes=None):
     """Mean train/test accuracy (± standard error over seeds) per case and config."""
-    from multiprocessing import Pool
     jobs = [(c, cfg, s) for c in range(len(REG_CASES)) for cfg in configs for s in seeds]
-    with Pool(processes) as pool:
-        results = pool.map(_reg_job, jobs, chunksize=1)
+    results = _parallel_map(_reg_job, jobs, processes)
     table = {}
     for c, cfg, tr, te, infl in results:
         table.setdefault((c, cfg), []).append((tr, te, infl))
@@ -301,35 +323,7 @@ def regularizer_comparison(configs, seeds, processes=None):
     return table
 
 
-class _MajorityLabel:
-    """Baseline: always predict the most common training label."""
-    def __init__(self, data):
-        self.y = int(2 * sum(data.values()) > len(data))
-    def __call__(self, x):
-        return self.y
-
-
-class _NearestNeighbour:
-    """Baseline: label of the nearest training row in Hamming distance
-    (majority vote among equally near rows, ties → most common label)."""
-    def __init__(self, data):
-        self.data = data
-        self.default = _MajorityLabel(data).y
-    def __call__(self, x):
-        if x in self.data:
-            return self.data[x]
-        best, votes = None, []
-        for xt, y in self.data.items():
-            d = sum(a != b for a, b in zip(x, xt))
-            if best is None or d < best:
-                best, votes = d, [y]
-            elif d == best:
-                votes.append(y)
-        s = 2 * sum(votes)
-        return 1 if s > len(votes) else 0 if s < len(votes) else self.default
-
-
-BASELINES = {"const": _MajorityLabel, "1nn": _NearestNeighbour}
+BASELINES = {"const": MajorityLabel, "1nn": NearestNeighbour}
 
 
 def cfg_name(cfg):
@@ -373,9 +367,72 @@ def run_regularizer_section():
     print()
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 6. A real dataset: the MONK's problems
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _monks_job(job):
+    """One (problem, widths, method, seed) BoolNet run on the official split."""
+    problem, widths, method, seed = job
+    train_data, test_data = load_monks(problem)
+    t0 = time.perf_counter()
+    if method == "λ=0":
+        net = train_with_restarts(17, widths, train_data, n_restarts=5,
+                                  verbose=False, seed=seed)
+    elif method == "λ=0.1":
+        net = train_with_restarts(17, widths, train_data, n_restarts=5,
+                                  verbose=False, seed=seed, lam=0.1)
+    else:
+        raise ValueError(method)
+    tr, te = evaluate(net, train_data, test_data, verbose=False)
+    return problem, tuple(widths), method, tr, te, net.complexity(), time.perf_counter() - t0
+
+
+def monks_comparison(widths_list, methods, seeds, processes=None):
+    jobs = [(p, w, m, s) for p in (1, 2, 3) for w in widths_list
+            for m in methods for s in seeds]
+    results = _parallel_map(_monks_job, jobs, processes)
+    table = {}
+    for p, w, m, tr, te, cx, dt in results:
+        table.setdefault((p, w, m), []).append((tr, te, cx, dt))
+    for p in (1, 2, 3):
+        train_data, test_data = load_monks(p)
+        print(f"  MONK-{p}  ({len(train_data)} train / {len(test_data)} test"
+              f"{', 5% train label noise' if p == 3 else ''})")
+        for name, model in [("majority label", MajorityLabel(train_data)),
+                            ("nearest neighbour", NearestNeighbour(train_data)),
+                            ("decision tree (ID3)", DecisionTree(train_data))]:
+            tr, te = evaluate(model, train_data, test_data, verbose=False)
+            print(f"    {name:34s} train {100*tr:5.1f}%   test {100*te:5.1f}%")
+        for w in widths_list:
+            for m in methods:
+                rows = table[(p, tuple(w), m)]
+                tes = [r[1] for r in rows]
+                mean = sum(tes) / len(tes)
+                se = ((sum((t - mean) ** 2 for t in tes) / (len(tes) - 1)) ** 0.5
+                      / len(tes) ** 0.5) if len(tes) > 1 else 0.0
+                tr = sum(r[0] for r in rows) / len(rows)
+                cx = sum(r[2] for r in rows) / len(rows)
+                dt = sum(r[3] for r in rows) / len(rows)
+                best = max(tes)
+                print(f"    BoolNet {str(w):8s} {m:24s} train {100*tr:5.1f}%   "
+                      f"test {100*mean:5.1f}% ± {100*se:4.1f} (best {100*best:5.1f})   "
+                      f"|W| {cx:5.1f}   {dt:5.1f}s/run")
+    return table
+
+
+def run_monks_section():
+    print("=" * 78)
+    print("6. MONK'S PROBLEMS (official train/test splits, 17 one-hot inputs)")
+    print("=" * 78)
+    monks_comparison([[8, 4], [12, 6]], ["λ=0", "λ=0.1"], range(10))
+    print()
+
+
 if __name__ == "__main__":
     run_convergence_section()
     run_complexity_section()
     run_representability_section()
     run_regularization_section()
     run_regularizer_section()
+    run_monks_section()
