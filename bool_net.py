@@ -867,6 +867,9 @@ def train(
     seed:       int  = None,
     lam:        float = 0.0,
     mu:         float = 0.0,
+    neutral:    str   = None,
+    tabu_len:   int   = 20,
+    max_neutral: int  = 100,
 ) -> BooleanNetwork:
     """
     Train using Boolean backpropagation.
@@ -893,6 +896,18 @@ def train(
 
     `mu` adds the total-influence (smoothness) penalty — see Objective. With
     mu > 0 the final pass is polish() (any single flip, not just removals).
+
+    `neutral` lets the search walk across plateaus: when no backprop
+    candidate strictly improves the objective, accept one that leaves it
+    unchanged instead of falling straight through to pair search / random
+    perturbation (README Step 17).
+      None      — off (default; behavior unchanged)
+      "remove"  — only neutral flips that REMOVE a weight. Removals strictly
+                  shrink the network, so this can't cycle.
+      "any"     — any neutral flip not among the last `tabu_len` flipped
+                  weights (a tabu list, to stop it undoing its own moves).
+    At most `max_neutral` consecutive neutral moves are made before the
+    usual fallbacks take over; any improving move resets the count.
     """
     rng = random.Random(seed)
     best_state, best_obj = None, float('inf')
@@ -902,6 +917,11 @@ def train(
     n_train = len(train_data)
     stuck_counter = 0
     all_wids = list(net.all_weight_ids())
+    if neutral not in (None, "remove", "any"):
+        raise ValueError(f"neutral must be None, 'remove' or 'any', not {neutral!r}")
+    from collections import deque
+    tabu = deque(maxlen=tabu_len)
+    neutral_run = 0
 
     if verbose:
         print(f"\n{'='*64}")
@@ -957,16 +977,32 @@ def train(
             key=weight_votes.get, reverse=True,
         )
         best_wid, best_net_score = None, 0
+        neutral_wid = None
         for wid in safe_candidates:
             score = _score_single_flip(net, objective, wid)
             if score > best_net_score:
                 best_net_score, best_wid = score, wid
+            elif (neutral and score == 0 and neutral_wid is None
+                  and wid not in tabu
+                  and (neutral == "any" or _weight_value(net, wid) == 1)):
+                neutral_wid = wid          # first in vote order
 
         if best_wid is not None:
             net.flip_weight(best_wid)
+            tabu.append(best_wid)
             if verbose:
                 _log_flip(net, best_wid, best_net_score)
             stuck_counter = 0
+            neutral_run = 0
+            continue
+
+        if neutral_wid is not None and neutral_run < max_neutral:
+            net.flip_weight(neutral_wid)
+            tabu.append(neutral_wid)
+            neutral_run += 1
+            if verbose:
+                print(f"         → neutral move [{neutral_run}/{max_neutral}]")
+                _log_flip(net, neutral_wid, 0)
             continue
 
         # ── 2. No single flip helped — try pair flips ──────────────
@@ -1018,6 +1054,7 @@ def train(
                 if verbose:
                     print(f"         → PAIR FLIP: {best_pair} fixes {best_pair_score} errors")
                 stuck_counter = 0
+                neutral_run = 0
                 pair_success = True
 
         if pair_success:
@@ -1114,8 +1151,11 @@ def train_with_restarts(
     seed: int = None,
     lam: float = 0.0,
     mu: float = 0.0,
+    **train_kwargs,
 ) -> BooleanNetwork:
     """
+    Extra keyword arguments (e.g. neutral="remove") are passed to train().
+
     `seed` controls both the per-restart network initialization AND the
     randomness inside each restart's train() call, so the entire multi-restart
     run is reproducible end to end given the same seed. Leave it as None for
@@ -1138,7 +1178,7 @@ def train_with_restarts(
             print(f"{'#'*64}")
         net = BooleanNetwork(n_inputs=n_inputs, layer_widths=layer_widths, seed=net_seed)
         train(net, train_data, max_steps=max_steps, verbose=verbose,
-              seed=train_seed, lam=lam, mu=mu)
+              seed=train_seed, lam=lam, mu=mu, **train_kwargs)
         loss = objective(net)
         if verbose:
             label = "objective" if objective.regularized else "loss"

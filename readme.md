@@ -564,13 +564,45 @@ What this shows:
 - Both run every restart, since neither reaches zero loss.
 - The final prune can't raise training error.
 
-With λ > 0, a flip that changes no training row's prediction but removes a weight scores +λ instead of 0, so it's accepted as progress. With λ = 0 the search sees no improving flip, counts itself stuck, falls back to random perturbations, and gives up after 5. So on MONK's the penalty matters less as an Occam prior than as **a way for the search to keep moving when the error count is flat**. This has not been isolated by a direct experiment yet.
+With λ > 0, a flip that changes no training row's prediction but removes a weight scores +λ instead of 0, so it's accepted as progress. With λ = 0 the search sees no improving flip, counts itself stuck, falls back to random perturbations, and gives up after 5. So on MONK's the penalty matters less as an Occam prior than as **a way for the search to keep moving when the error count is flat**. *(Step 17 tested this directly and found it is only part of the story.)*
 
 **What this points to next:** the search, not the objective. Seeds that reach 100% on MONK-1 exist, but the search finds them unreliably, and bigger networks make it worse. Candidate directions:
 - deliberate neutral moves (accept zero‑change flips, with a tabu list to avoid cycling);
 - a smarter escape than random perturbation;
 - more restarts now that each one is cheap;
 - the pair‑search speedup from Step 14, which these 34‑input layers make much more pressing.
+
+---
+
+### Step 17 — Neutral moves, isolated: only part of why λ helps the search
+
+Step 16 concluded, by elimination, that λ > 0 trains better on MONK's because it turns error‑neutral, weight‑removing flips into accepted moves. `train(..., neutral=...)` tests that directly. When no candidate strictly improves the objective, it accepts a neutral one instead of falling through to pair search or random perturbation:
+
+- `"remove"` accepts only neutral removals: exactly the extra move λ > 0 allows.
+- `"any"` accepts any neutral flip that isn't in a 20‑entry tabu list of recent flips.
+
+It is off by default, so default behavior is unchanged (verified by fingerprint).
+
+**Results** (`test.py` section 7; MONK's, `[8,4]`, 10 seeds; train accuracy / test accuracy / final active weights):
+
+```
+                            MONK-1                 MONK-2                 MONK-3 (noisy)
+λ=0                         79.8 / 76.9 /  99      65.0 / 67.2 / 111      80.3 / 80.3 / 106
+λ=0 + neutral removals      85.5 / 80.4 /  99      64.9 / 67.2 / 113      87.0 / 88.9 / 104
+λ=0 + any neutral move      86.0 / 79.1 / 100      65.0 / 67.1 / 113      87.0 / 88.9 / 104
+λ=1e-9                      92.7 / 88.8 /  14      75.4 / 67.0 /  23      94.7 / 96.6 / 12
+λ=0.1                       92.7 / 88.8 /  14      75.4 / 66.5 /  22      94.7 / 96.6 / 12
+```
+
+What this shows:
+
+- **Neutral moves explain part of the gap, not all of it.** On MONK‑1 and MONK‑3 they recover about half of λ's training‑accuracy gain (+6–7 of +13–14 points). On MONK‑2 they recover none of it. Step 16's by‑elimination conclusion was incomplete.
+- **The size column shows the rest.** With neutral moves the networks still end with about 100 active weights; with any λ > 0 they end with 12–23. Neutral removals only fire when the search is stuck. λ instead prefers removals at *every* step, whenever two flips fix the same number of errors, so the network stays small throughout training. **Working hypothesis (not yet isolated): sparse networks are easier to search.**
+- **Adding neutral moves to λ > 0 is a no‑op.** Every single flip changes the weight count by ±1, so with λ > 0 no flip ever scores exactly 0, and the rows are identical. A tiny λ already supersedes the neutral‑move option; it stays in the code (tested, off by default) as a documented result.
+
+**Next, if the sparsity hypothesis holds:**
+- **Initialize sparser.** Each neuron currently includes each input signal (as `x` or `¬x`) with probability 2/3, so networks start dense, at roughly 100 weights on MONK's.
+- **Make λ = 1e‑9 the default.** It costs essentially nothing in fit, and it would be a deliberate behavior change.
 
 ---
 

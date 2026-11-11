@@ -198,6 +198,42 @@ class TestTraining(unittest.TestCase):
         # Make sure the scenario actually exercises the fix.
         self.assertTrue(caught_a_late_regression)
 
+    def test_neutral_moves(self):
+        rng = random.Random(8)
+        data = {x: rng.randint(0, 1) for x in rng.sample(all_inputs(6), 40)}
+        with self.assertRaises(ValueError):
+            train(BooleanNetwork(6, [4], seed=0), data, verbose=False, neutral="bogus")
+        for mode in ("remove", "any"):
+            fps = set()
+            for _ in range(2):
+                net = BooleanNetwork(6, [6, 3], seed=1)
+                start = compute_loss(net, data)
+                train(net, data, max_steps=150, verbose=False, seed=1, neutral=mode)
+                self.assertFalse(net.has_contradiction(), mode)
+                self.assertLessEqual(compute_loss(net, data), start, mode)
+                fps.add(weights_fingerprint(net))
+            self.assertEqual(len(fps), 1, f"{mode} not reproducible")
+
+    def test_neutral_removals_only_ever_remove(self):
+        """In "remove" mode a neutral move must never add a connection."""
+        import bool_net
+        rng = random.Random(2)
+        data = {x: rng.randint(0, 1) for x in all_inputs(5)}
+        net = BooleanNetwork(5, [5, 3], seed=4)
+        flips = []
+        original = bool_net._log_flip
+        bool_net._log_flip = lambda n, wid, score: flips.append(
+            (wid, bool_net._weight_value(n, wid), score))
+        try:
+            import contextlib, io
+            with contextlib.redirect_stdout(io.StringIO()):
+                train(net, data, max_steps=150, verbose=True, seed=4, neutral="remove")
+        finally:
+            bool_net._log_flip = original
+        neutral = [(w, v) for w, v, score in flips if score == 0]
+        self.assertTrue(neutral, "scenario never made a neutral move")
+        self.assertTrue(all(v == 0 for _, v in neutral), neutral)
+
     def test_no_contradictions_after_training(self):
         data, _ = make_dataset(3, parity, observed_fraction=1.0, seed=0)
         for seed in range(10):

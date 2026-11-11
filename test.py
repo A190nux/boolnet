@@ -1,5 +1,5 @@
 """
-test.py — Six investigations, each producing numbers to fold back into the README:
+test.py — Seven investigations, each producing numbers to fold back into the README:
 
   1. Rerun XOR(n=2) and Parity(n=3) convergence stats with real, reproducible seeds
      (replaces old convergence claims with numbers from THIS run).
@@ -10,6 +10,7 @@ test.py — Six investigations, each producing numbers to fold back into the REA
   4. Measure whether Boolean regularization (lam > 0) improves test accuracy.
   5. Compare regularizers: weight count, total influence, ensembles.
   6. A real dataset: MONK's problems vs decision tree / nearest-neighbour baselines.
+  7. Neutral moves: isolating why λ > 0 helps the search.
 
 Fast correctness tests live in tests/ (python3 -m unittest discover -s tests).
 
@@ -371,19 +372,23 @@ def run_regularizer_section():
 # 6. A real dataset: the MONK's problems
 # ─────────────────────────────────────────────────────────────────────────────
 
+MONKS_METHODS = {
+    "λ=0":                     {},
+    "λ=0.1":                   {"lam": 0.1},
+    "λ=1e-9":                  {"lam": 1e-9},
+    "λ=0 + neutral removals":  {"neutral": "remove"},
+    "λ=0 + any neutral move":  {"neutral": "any"},
+    "λ=0.1 + any neutral move": {"lam": 0.1, "neutral": "any"},
+}
+
+
 def _monks_job(job):
     """One (problem, widths, method, seed) BoolNet run on the official split."""
     problem, widths, method, seed = job
     train_data, test_data = load_monks(problem)
     t0 = time.perf_counter()
-    if method == "λ=0":
-        net = train_with_restarts(17, widths, train_data, n_restarts=5,
-                                  verbose=False, seed=seed)
-    elif method == "λ=0.1":
-        net = train_with_restarts(17, widths, train_data, n_restarts=5,
-                                  verbose=False, seed=seed, lam=0.1)
-    else:
-        raise ValueError(method)
+    net = train_with_restarts(17, widths, train_data, n_restarts=5,
+                              verbose=False, seed=seed, **MONKS_METHODS[method])
     tr, te = evaluate(net, train_data, test_data, verbose=False)
     return problem, tuple(widths), method, tr, te, net.complexity(), time.perf_counter() - t0
 
@@ -415,7 +420,7 @@ def monks_comparison(widths_list, methods, seeds, processes=None):
                 cx = sum(r[2] for r in rows) / len(rows)
                 dt = sum(r[3] for r in rows) / len(rows)
                 best = max(tes)
-                print(f"    BoolNet {str(w):8s} {m:24s} train {100*tr:5.1f}%   "
+                print(f"    BoolNet {str(w):8s} {m:26s} train {100*tr:5.1f}%   "
                       f"test {100*mean:5.1f}% ± {100*se:4.1f} (best {100*best:5.1f})   "
                       f"|W| {cx:5.1f}   {dt:5.1f}s/run")
     return table
@@ -429,6 +434,28 @@ def run_monks_section():
     print()
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 7. Why does λ help the search? Neutral moves, isolated
+# ─────────────────────────────────────────────────────────────────────────────
+
+def run_neutral_section():
+    """
+    Step 16 found that λ=1e-9 trains exactly as well as λ=0.1 on MONK's, and
+    concluded by elimination that the gain comes from λ>0 turning
+    error-neutral, weight-removing flips into accepted moves. This section
+    tests that directly: λ=0 plus ONLY those moves ("neutral removals")
+    should match λ=1e-9. "any neutral move" (with a tabu list) asks whether
+    a freer plateau walk helps more.
+    """
+    print("=" * 78)
+    print("7. NEUTRAL MOVES: isolating why λ > 0 helps the search (MONK's, [8,4])")
+    print("=" * 78)
+    monks_comparison([[8, 4]], ["λ=0", "λ=1e-9", "λ=0 + neutral removals",
+                                "λ=0 + any neutral move", "λ=0.1",
+                                "λ=0.1 + any neutral move"], range(10))
+    print()
+
+
 if __name__ == "__main__":
     run_convergence_section()
     run_complexity_section()
@@ -436,3 +463,4 @@ if __name__ == "__main__":
     run_regularization_section()
     run_regularizer_section()
     run_monks_section()
+    run_neutral_section()
