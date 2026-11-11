@@ -793,8 +793,9 @@ def compute_objective(net: BooleanNetwork, data, lam: float = 0.0,
     return Objective(data, lam, mu)(net)
 
 
-def _score_pair_flip(net, objective, wid_a, wid_b):
-    old = objective(net)
+def _score_pair_flip(net, objective, wid_a, wid_b, old=None):
+    if old is None:
+        old = objective(net)
     net.flip_weight(wid_a)
     net.flip_weight(wid_b)
     new = objective(net)
@@ -803,13 +804,16 @@ def _score_pair_flip(net, objective, wid_a, wid_b):
     return old - new
 
 
-def _score_single_flip(net, objective, wid):
+def _score_single_flip(net, objective, wid, old=None):
     """Net objective reduction (old - new) from applying a single flip, over
     the FULL dataset — not just the error rows that voted for it. A flip that
     fixes some error rows can simultaneously break rows that were already
     correct; this is what actually decides whether the flip helps. When the
-    objective is regularized, the change in penalty is included too."""
-    old = objective(net)
+    objective is regularized, the change in penalty is included too.
+    Pass `old` (the current objective) to skip recomputing it when scoring
+    many candidates against the same state."""
+    if old is None:
+        old = objective(net)
     net.flip_weight(wid)
     new = objective(net)
     net.flip_weight(wid)
@@ -876,6 +880,93 @@ def _weight_value(net, wid) -> int:
         _, k, i, j = wid
         return net.layers[k].W[i][j]
     return net.out_w[wid[1]]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Pair-flip pre-filter
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _pair_prefilter_reference(net, active_list, x):
+    """
+    The original pair pre-filter, kept as the reference the fast version is
+    tested against: every pair (a < b) of active weights whose joint flip
+    changes the output on row x without leaving any contradictory neuron.
+    One full forward pass and one full contradiction scan per pair.
+    """
+    orig_out = net(x)
+    out = []
+    for a in range(len(active_list)):
+        wa = active_list[a]
+        for b in range(a + 1, len(active_list)):
+            wb = active_list[b]
+            net.flip_weight(wa)
+            net.flip_weight(wb)
+            flipped_out = net(x)
+            contradiction = net.has_contradiction()
+            net.flip_weight(wb)
+            net.flip_weight(wa)
+            if flipped_out != orig_out and not contradiction:
+                out.append((wa, wb))
+    return out
+
+
+def _conflicts(net) -> int:
+    """Total number of (neuron, signal) pairs requiring both x and ¬x."""
+    total = 0
+    for layer in net.layers:
+        m = layer.input_width // 2
+        W = layer.W
+        for j in range(layer.output_width):
+            for i in range(m):
+                if W[i][j] and W[i + m][j]:
+                    total += 1
+    return total
+
+
+def _pair_prefilter(net, active_list, x):
+    """
+    Same result as _pair_prefilter_reference, in the same order, but with
+    one single-row backward pass per first weight instead of one forward
+    pass per pair:
+
+      • Output: after flipping wa, backward() gives d_b = ∂f/∂w_b on row x
+        for every w_b at once, and flipping w_b next changes the output iff
+        d_b = 1. So out(wa, wb) = out(wa) XOR d_b — exact, because
+        backward() is exact (verified against brute force).
+      • Contradictions: a flip touches one (neuron, signal) pair, so the
+        conflict count after flipping w_b is the count after w_a, minus
+        that pair's old conflict bit, plus its new one — O(1) per pair.
+    """
+    pd = PackedData({x: 0})
+    orig_out = net.forward_packed(pd) & 1
+    out = []
+    for a in range(len(active_list)):
+        wa = active_list[a]
+        rest = active_list[a + 1:]
+        if not rest:
+            break
+        net.flip_weight(wa)
+        out_a = net.forward_packed(pd) & 1
+        derivs = net.backward_packed(pd)
+        conflicts_a = _conflicts(net)
+        for wb in rest:
+            d_b = derivs.get(wb, 0) & 1
+            if (out_a ^ d_b) == orig_out:
+                continue
+            if wb[0] == 'layer':
+                _, k, i, j = wb
+                W = net.layers[k].W
+                m = net.layers[k].input_width // 2
+                p = i % m
+                before = W[p][j] & W[p + m][j]
+                after = ((W[p][j] ^ (i == p)) & (W[p + m][j] ^ (i == p + m)))
+                conflicts_ab = conflicts_a - before + after
+            else:
+                conflicts_ab = conflicts_a
+            if conflicts_ab == 0:
+                out.append((wa, wb))
+        net.flip_weight(wa)
+    return out
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -973,13 +1064,14 @@ def train(
                 print("  ✓ Zero training loss — converged.")
             break
 
-        # Collect all misclassified rows
-        error_rows = packed.rows_in(error_mask(net, packed))  # used by pair search
+        # Misclassified rows, as a mask (computed once per step, on the
+        # committed state) and as a list (used by pair search).
+        err = error_mask(net, packed)
+        error_rows = packed.rows_in(err)
 
         # ── 1. Single‑flip candidates via backprop ─────────────────
         # One bit-packed backward pass over all error rows at once: each
         # weight gets a mask of the error rows where its derivative is 1.
-        err = error_mask(net, packed)
         deriv_masks = net.backward_packed(packed, err)
         # wid -> number of error rows where derivative=1. Inserted in the
         # same order the old per-row loop used (by first error row where the
@@ -1001,8 +1093,9 @@ def train(
         )
         best_wid, best_net_score = None, 0
         neutral_wid = None
+        current = objective(net)
         for wid in safe_candidates:
-            score = _score_single_flip(net, objective, wid)
+            score = _score_single_flip(net, objective, wid, current)
             if score > best_net_score:
                 best_net_score, best_wid = score, wid
             elif (neutral and score == 0 and neutral_wid is None
@@ -1045,29 +1138,16 @@ def train(
         # by value removes that dependence so pair search order (and its
         # tie-breaks in max(pair_scores, ...) below) is reproducible.
         pair_success = False
-        # Try pairs on the first error row (quick filter)
+        # Quick filter on the first error row: pairs whose joint flip changes
+        # its output without creating a contradiction (two individually safe
+        # flips can jointly require a signal and its complement). See
+        # _pair_prefilter — one backward pass per first weight, not one
+        # forward pass per pair (README Step 21).
         first_err = error_rows[0]
-        orig_out = net(first_err)
-        pair_candidates = []
-        for a in range(len(active_list)):
-            wa = active_list[a]
-            for b in range(a + 1, len(active_list)):
-                wb = active_list[b]
-                net.flip_weight(wa)
-                net.flip_weight(wb)
-                flipped_out = net(first_err)
-                # Two flips that are each individually safe can still
-                # jointly create a contradiction (e.g. requiring a signal
-                # and its complement together) — check the resulting state
-                # directly rather than relying on is_safe_flip per-weight.
-                contradiction = net.has_contradiction()
-                net.flip_weight(wb)
-                net.flip_weight(wa)
-                if flipped_out != orig_out and not contradiction:
-                    pair_candidates.append((wa, wb))
+        pair_candidates = _pair_prefilter(net, active_list, first_err)
 
         if pair_candidates:
-            pair_scores = {pair: _score_pair_flip(net, objective, pair[0], pair[1])
+            pair_scores = {pair: _score_pair_flip(net, objective, pair[0], pair[1], current)
                            for pair in pair_candidates}
             best_pair = max(pair_scores, key=pair_scores.get)
             best_pair_score = pair_scores[best_pair]

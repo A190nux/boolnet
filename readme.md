@@ -485,7 +485,7 @@ Parity n=4, full        0.1        41.88s           9.99s       4.2×
 
 The λ>0 runs gain the most, because pruning is almost entirely loss evaluations. That was Step 13's cost caveat, now mostly paid off.
 
-**Where the remaining time goes.** In the λ=0 majority case, about 80% is now the pair‑search pre‑filter. For each of O(active²) candidate pairs it flips both weights, runs a per‑row `forward()` on the first error row, and calls a full‑network `has_contradiction()`. Bit‑packing doesn't touch that loop. The obvious fixes are a single‑row `forward_packed`, a contradiction check limited to the two flipped neurons, and incremental re‑evaluation of only the neurons a flip affects. Those are the next target. The `O(depth² × width³)` re‑simulation inside backward is still there too; it's now paid once per step instead of once per error row.
+**Where the remaining time goes.** In the λ=0 majority case, about 80% is now the pair‑search pre‑filter. For each of O(active²) candidate pairs it flips both weights, runs a per‑row `forward()` on the first error row, and calls a full‑network `has_contradiction()`. Bit‑packing doesn't touch that loop. The obvious fixes are a single‑row `forward_packed`, a contradiction check limited to the two flipped neurons, and incremental re‑evaluation of only the neurons a flip affects. Those are the next target. The `O(depth² × width³)` re‑simulation inside backward is still there too; it's now paid once per step instead of once per error row. *(The pair pre‑filter was fixed in Step 21.)*
 
 ---
 
@@ -626,7 +626,7 @@ decision tree            92.6        (100)       86.6        (100)       89.8   
 What this shows:
 
 - **Sparse initialization is the biggest single improvement so far.** MONK‑1 goes from 77% to about 99% test, clearly beating the decision tree (92.6%), so the network now usually recovers the exact concept. MONK‑2, which looked hopeless (stuck at the 67% of predicting the common label), climbs to about 80%. That beats nearest neighbour (72.2%) but is still behind the tree (86.6%). MONK‑3 holds its ~96%, now without needing λ.
-- **The hypothesis was close but not quite right.** With a sparse start, λ=0 ends with 40–90 active weights, yet it trains as well as λ=1e‑9, which ends with about 15. So what matters is *starting* sparse, not *staying* sparse. A plausible reason: a dense AND‑neuron is false on almost every row, so almost no single flip changes its output and backprop finds few useful candidates. A sparse neuron fires often, so the derivative signal is rich. This explanation is untested.
+- **The hypothesis was close but not quite right.** With a sparse start, λ=0 ends with 40–90 active weights, yet it trains as well as λ=1e‑9, which ends with about 15. So what matters is *starting* sparse, not *staying* sparse. A plausible reason: a dense AND‑neuron is false on almost every row, so almost no single flip changes its output and backprop finds few useful candidates. A sparse neuron fires often, so the derivative signal is rich. *(Step 21 measured this and confirmed it.)*
 - **λ is now mostly redundant for fitting.** Its training advantage at the default init (Steps 16–17) disappears once the start is sparse. It still makes the final network 3–4× smaller, which makes the learned formula much easier to read.
 - **Cost:** sparse MONK‑2 runs are 5–7× slower (150–220 s), because the search keeps making progress instead of giving up early.
 
@@ -683,6 +683,45 @@ Based on Steps 18–19, `BooleanNetwork`, `train_with_restarts` and `train_ensem
 - The golden‑fingerprint test now pins both behaviors: dense (`density=None`) and the new sparse default.
 
 Expect results under the new default to look like Step 18's sparse rows, e.g. MONK‑1 ≈ 99% test vs 77% before. Expect training to sometimes take longer, because the search keeps making progress instead of stalling.
+
+---
+
+### Step 21 — Pair search ~5× faster, and why dense starts were dead
+
+**The bottleneck.** Profiling a sparse‑default MONK‑2 run (124 s) put about 100 s in the pair‑flip pre‑filter. For every pair of candidate weights it flipped both, ran a per‑row `forward()` on the first error row, ran a full‑network `has_contradiction()` scan, and flipped them back: 2.66 M of each in one run. A further ~8 s went to recomputing the unchanged "before" objective for every candidate scored.
+
+**The fix** (`_pair_prefilter`) makes three changes. All are exact:
+
+1. **Output check via backprop.** After flipping the first weight `wa`, one single‑row `backward_packed()` gives `∂f/∂w_b` for *every* second weight at once. The joint flip changes the output iff `out(wa) XOR ∂f/∂w_b ≠ original output`. That's one backward pass per `wa` instead of one forward pass per pair, and it's exact because backward is exact (verified against brute force since Step 9).
+2. **Contradiction check in O(1).** A flip touches one (neuron, signal) pair, so the network's conflict count after flipping `w_b` is the count after `w_a`, minus that pair's old conflict bit, plus its new one.
+3. **Cached "before" objective** in single‑ and pair‑flip scoring.
+
+The original pre‑filter is kept as `_pair_prefilter_reference`. A test checks the two give identical candidate lists, in the same order, on random networks, including ones that already contain a contradiction. A deliberately broken conflict count makes that test fail. End‑to‑end training fingerprints match the previous commit in all four combinations of dense or sparse start and λ = 0 or 0.1, including a MONK‑1 run. Training decisions are unchanged.
+
+**Speed** (`train_with_restarts(n_restarts=3)`, sparse default; old and new code run side by side on the same machine):
+
+```
+MONK-1     3.6 s → 0.7 s   (5.1×)
+MONK-2    39.8 s → 7.1 s   (5.6×)
+MONK-3     8.0 s → 1.7 s   (4.7×)
+Parity‑4  11.4 s → 2.7 s   (4.2×, 10 seeds × 10 restarts)
+```
+
+**Why dense starts were dead, now measured.** While benchmarking, dense‑init MONK's runs finished in a fraction of a second. They weren't fast; they were *giving up*. Here is what a run looks like at step 1, and how often a single `train()` run gives up within 6 steps without fitting (40 runs each):
+
+```
+                     layer‑0 neuron fires on   candidate weights at step 1   gave up within 6 steps
+MONK‑1  dense (2/3)          0.1% of rows               1.9                        27/40
+        sparse (0.05)       39.7%                      59.2                         0/40
+MONK‑2  dense (2/3)          0.1%                       3.8                        28/40
+        sparse (0.05)       39.6%                      67.8                         0/40
+MONK‑3  dense (2/3)          0.1%                       3.2                        27/40
+        sparse (0.05)       39.8%                      55.3                         1/40
+```
+
+A dense AND‑neuron with about 11 of 17 signals required is false on essentially every row. So almost no single or pair flip changes any output, backprop returns a handful of candidates, nothing improves, and after 5 random perturbations the run stops. Two‑thirds of dense runs on MONK's were dead on arrival. This confirms Step 18's explanation for why sparse starts work. It also *plausibly* explains Steps 16–17: with so few candidates, λ's weight‑removing moves and the neutral moves may have mattered mainly by keeping otherwise dead runs moving. That part is untested.
+
+(Small cleanup found along the way: `train()` computed the error mask twice per step; it now computes it once. No behavior change, fingerprint verified.)
 
 ---
 

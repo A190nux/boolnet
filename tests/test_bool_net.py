@@ -93,6 +93,31 @@ class TestBackwardExactness(unittest.TestCase):
                         if (subset >> r) & 1:
                             self.assertEqual(rowwise.get(wid, 0), want)
 
+    def test_fast_pair_prefilter_matches_reference(self):
+        from bool_net import _pair_prefilter, _pair_prefilter_reference
+        rng = random.Random(606)
+        checked = 0
+        for n, widths in [(2, [3]), (3, [4, 4]), (4, [5, 3]), (5, [4, 3, 2])]:
+            for _ in range(12):
+                net = random_net(rng, n, widths)
+                # Sometimes start from a state that already has a contradiction.
+                if rng.random() < 0.3:
+                    layer = net.layers[0]
+                    m = layer.input_width // 2
+                    j = rng.randrange(layer.output_width)
+                    p = rng.randrange(m)
+                    layer.W[p][j] = layer.W[p + m][j] = 1
+                wids = list(net.all_weight_ids())
+                active = sorted(rng.sample(wids, min(len(wids), rng.randint(2, 14))))
+                fp = weights_fingerprint(net)
+                for x in rng.sample(all_inputs(n), 3):
+                    fast = _pair_prefilter(net, active, x)
+                    ref = _pair_prefilter_reference(net, active, x)
+                    self.assertEqual(fast, ref, f"{n} {widths} x={x}")
+                    checked += len(active) * (len(active) - 1) // 2
+                self.assertEqual(weights_fingerprint(net), fp)   # net restored
+        self.assertGreater(checked, 2000)
+
     def test_backward_does_not_mutate_net(self):
         net = BooleanNetwork(3, [4, 4], seed=7)
         before = weights_fingerprint(net)
