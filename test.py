@@ -1,5 +1,5 @@
 """
-test.py — Eight investigations, each producing numbers to fold back into the README:
+test.py — Nine investigations, each producing numbers to fold back into the README:
 
   1. Rerun XOR(n=2) and Parity(n=3) convergence stats with real, reproducible seeds
      (replaces old convergence claims with numbers from THIS run).
@@ -12,6 +12,7 @@ test.py — Eight investigations, each producing numbers to fold back into the R
   6. A real dataset: MONK's problems vs decision tree / nearest-neighbour baselines.
   7. Neutral moves: isolating why λ > 0 helps the search.
   8. Sparse initialization: are sparse networks easier to search?
+  9. Does sparse initialization hurt the toy benchmarks?
 
 Fast correctness tests live in tests/ (python3 -m unittest discover -s tests).
 
@@ -25,6 +26,11 @@ import time
 from bool_net import *
 from baselines import DecisionTree, MajorityLabel, NearestNeighbour
 from datasets import load_monks
+
+# Sections 1-8 were measured with the original dense init. Since Step 20 the
+# library default is sparse (density=0.05); DENSE pins those sections to
+# what they measured, so rerunning them reproduces the README's numbers.
+DENSE = None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -51,6 +57,7 @@ def convergence_stats(desc, n, fn, widths, n_seeds=30, max_steps=500,
         net = train_with_restarts(
             n_inputs=n, layer_widths=widths, train_data=train_data,
             max_steps=max_steps, n_restarts=n_restarts, verbose=False, seed=seed,
+            density=DENSE,
         )
         loss = compute_loss(net, train_data)
         losses.append(loss)
@@ -82,7 +89,7 @@ def run_convergence_section():
 def time_backward(depth, width, n_inputs=4, n_samples=30, seed=1):
     """Average wall-clock time of a single net.backward(x) call."""
     widths = [width] * depth
-    net = BooleanNetwork(n_inputs=n_inputs, layer_widths=widths, seed=seed)
+    net = BooleanNetwork(n_inputs=n_inputs, layer_widths=widths, seed=seed, density=DENSE)
     xs = all_inputs(n_inputs)
     rng = random.Random(seed)
     samples = [rng.choice(xs) for _ in range(n_samples)]
@@ -162,7 +169,7 @@ def representability_probe(desc, n, fn, widths, n_trials=20, max_steps=500,
     for _ in range(n_trials):
         net_seed = rng.randint(0, 2**31 - 1)
         train_seed = rng.randint(0, 2**31 - 1)
-        net = BooleanNetwork(n_inputs=n, layer_widths=widths, seed=net_seed)
+        net = BooleanNetwork(n_inputs=n, layer_widths=widths, seed=net_seed, density=DENSE)
         train(net, train_data, max_steps=max_steps, verbose=False, seed=train_seed)
         if compute_loss(net, train_data) == 0:
             successes += 1
@@ -233,7 +240,7 @@ def run_regularization_section(n_seeds=8, lams=(0.0, 0.1, 0.5)):
                 train_data, test_data = make_dataset(n, fn, observed_fraction=frac,
                                                      seed=100 + s)
                 net = train_with_restarts(n, widths, train_data, n_restarts=5,
-                                          verbose=False, seed=s, lam=lam)
+                                          verbose=False, seed=s, lam=lam, density=DENSE)
                 a, b = evaluate(net, train_data, test_data, verbose=False)
                 tr_acc += a; te_acc += b; size += net.complexity()
             print(f"    lam={lam:<4}  train {100*tr_acc/n_seeds:5.1f}%   "
@@ -271,11 +278,11 @@ def _reg_job(job):
         return case_i, cfg, tr, te, None
     if kind == "ensemble":
         net = train_ensemble(n, widths, train_data, n_members=9, seed=seed,
-                             lam=lam, mu=mu)
+                             lam=lam, mu=mu, density=DENSE)
         infl = None
     else:
         net = train_with_restarts(n, widths, train_data, n_restarts=5,
-                                  verbose=False, seed=seed, lam=lam, mu=mu)
+                                  verbose=False, seed=seed, lam=lam, mu=mu, density=DENSE)
         infl = total_influence(net, influence_rows(n))
     tr, te = evaluate(net, train_data, test_data, verbose=False)
     return case_i, cfg, tr, te, infl
@@ -394,8 +401,9 @@ def _monks_job(job):
     problem, widths, method, seed = job
     train_data, test_data = load_monks(problem)
     t0 = time.perf_counter()
+    kwargs = {"density": DENSE, **MONKS_METHODS[method]}
     net = train_with_restarts(17, widths, train_data, n_restarts=5,
-                              verbose=False, seed=seed, **MONKS_METHODS[method])
+                              verbose=False, seed=seed, **kwargs)
     tr, te = evaluate(net, train_data, test_data, verbose=False)
     return problem, tuple(widths), method, tr, te, net.complexity(), time.perf_counter() - t0
 
@@ -480,12 +488,93 @@ def run_sparse_init_section():
     for density in (None, 0.3, 0.15, 0.05):
         sizes = [BooleanNetwork(17, [8, 4], seed=s, density=density).complexity()
                  for s in range(50)]
-        print(f"  density {str(density or '2/3 (default)'):14s} → "
+        print(f"  density {str(density or '2/3 (dense)'):14s} → "
               f"{sum(sizes)/len(sizes):5.1f} active weights at init")
     monks_comparison([[8, 4]], ["λ=0", "λ=0, density 0.3", "λ=0, density 0.15",
                                 "λ=0, density 0.05", "λ=1e-9",
                                 "λ=1e-9, density 0.3", "λ=1e-9, density 0.15",
                                 "λ=1e-9, density 0.05"], range(10))
+    print()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 9. Does sparse initialization hurt the toy benchmarks?
+# ─────────────────────────────────────────────────────────────────────────────
+
+DENSITIES = (None, 0.3, 0.15, 0.05)
+
+FIT_CASES = [
+    ("XOR (n=2)",          2, xor2,     [4, 4]),
+    ("Parity (n=3)",       3, parity,   [4]),
+    ("Parity (n=3)",       3, parity,   [6, 4]),
+    ("Parity (n=4)",       4, parity,   [4, 4]),
+    ("Majority (n=3)",     3, majority, [4, 4]),
+]
+
+
+def _fit_job(job):
+    """One single train() run (no restarts) on a full truth table."""
+    case_i, density, seed = job
+    _, n, fn, widths = FIT_CASES[case_i]
+    data, _ = make_dataset(n, fn, observed_fraction=1.0, seed=0)
+    rng = random.Random(seed)
+    net = BooleanNetwork(n, widths, seed=rng.randint(0, 2**31 - 1), density=density)
+    t0 = time.perf_counter()
+    train(net, data, verbose=False, seed=rng.randint(0, 2**31 - 1))
+    return case_i, density, compute_loss(net, data) == 0, time.perf_counter() - t0
+
+
+def _gen_job(job):
+    case_i, density, lam, seed = job
+    _, n, fn, widths, frac = REG_CASES[case_i]
+    train_data, test_data = make_dataset(n, fn, observed_fraction=frac, seed=seed)
+    net = train_with_restarts(n, widths, train_data, n_restarts=5, verbose=False,
+                              seed=seed, lam=lam, density=density)
+    tr, te = evaluate(net, train_data, test_data, verbose=False)
+    return case_i, density, lam, tr, te
+
+
+def _dname(d):
+    return "dense (2/3)" if d is None else f"{d}"
+
+
+def run_sparse_toy_section(n_fit=40, gen_seeds=range(200, 220)):
+    print("=" * 78)
+    print("9. SPARSE INIT ON THE TOY BENCHMARKS")
+    print("=" * 78)
+    print(f"  (a) Fitting: single train() runs reaching zero loss, out of {n_fit}")
+    jobs = [(c, d, s) for c in range(len(FIT_CASES)) for d in DENSITIES
+            for s in range(n_fit)]
+    res = _parallel_map(_fit_job, jobs)
+    head = "".join(f"{_dname(d):>16s}" for d in DENSITIES)
+    ghead = "".join(f"{_dname(d):>17s}" for d in DENSITIES)
+    print(f"    {'':28s}{head}")
+    for c, (desc, n, fn, widths) in enumerate(FIT_CASES):
+        cells = ""
+        for d in DENSITIES:
+            r = [x for x in res if x[0] == c and x[1] == d]
+            ok = sum(x[2] for x in r)
+            t = sum(x[3] for x in r) / len(r)
+            cells += f"{ok:>6d}/{len(r):<3d}{t:5.2f}s"
+        print(f"    {desc + ' ' + str(widths):28s}{cells}")
+    print()
+    print("  (b) Generalization: test accuracy, seeds 200-219, n_restarts=5")
+    jobs = [(c, d, lam, s) for c in range(len(REG_CASES)) for d in DENSITIES
+            for lam in (0.0, 0.1) for s in gen_seeds]
+    res = _parallel_map(_gen_job, jobs)
+    for lam in (0.0, 0.1):
+        print(f"    λ={lam}")
+        print(f"    {'':28s}{ghead}")
+        for c, (desc, *_rest) in enumerate(REG_CASES):
+            cells = ""
+            for d in DENSITIES:
+                r = [x for x in res if x[0] == c and x[1] == d and x[2] == lam]
+                tes = [x[4] for x in r]
+                te = sum(tes) / len(tes)
+                se = (sum((t - te) ** 2 for t in tes) / (len(tes) - 1)) ** 0.5 / len(tes) ** 0.5
+                cells += f"     {100*te:5.1f} ± {100*se:3.1f}"
+            print(f"    {desc:28s}{cells}")
+    print("    cells: test% ± standard error over seeds (train accuracy was 99.4-100% everywhere)")
     print()
 
 
@@ -498,3 +587,4 @@ if __name__ == "__main__":
     run_monks_section()
     run_neutral_section()
     run_sparse_init_section()
+    run_sparse_toy_section()

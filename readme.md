@@ -634,6 +634,58 @@ What this shows:
 
 ---
 
+### Step 19 — Sparse initialization doesn't hurt the toy benchmarks
+
+Before changing any default, Step 18's open question had to be answered: does a sparse start hurt the small problems, especially parity, whose neurons need many literals? (`test.py` section 9.)
+
+**Fitting** (single `train()` runs, no restarts, full truth table; runs reaching zero loss out of 40):
+
+```
+                          default   0.3     0.15    0.05
+XOR (n=2)    [4,4]        40        40      40      40
+Parity (n=3) [4]          39        40      38      39
+Parity (n=3) [6,4]        34        35      37      37
+Parity (n=4) [4,4]         7        13       3       7
+Majority (n=3) [4,4]      35        38      34      37
+```
+
+**Generalization** (Step 15's cases, confirmation seeds 200–219, `n_restarts=5`; test accuracy ± standard error; training accuracy was 99.4–100% everywhere):
+
+```
+                        λ=0                                               λ=0.1
+                        default     0.3         0.15        0.05          default     0.3         0.15        0.05
+Majority n=5, 75%       52.5±2.7    51.2±2.9    51.2±2.4    48.1±2.3      55.0±3.1    53.1±2.5    55.0±3.1    54.4±2.9
+Majority n=5, 50%       55.9±1.9    57.8±1.4    57.8±2.0    57.5±1.8      60.0±1.2    61.6±1.5    61.9±1.8    59.4±1.5
+AtLeastTwo n=5, 50%     72.5±2.2    70.9±2.5    68.8±2.6    67.8±1.7      71.6±1.9    72.5±1.7    72.2±1.9    72.2±1.5
+AtLeastThree n=6, 50%   65.9±1.1    67.7±1.3    66.4±1.8    66.7±1.5      70.5±0.9    69.8±1.3    70.6±1.2    69.1±0.9
+custom n=4, 50%         55.0±3.4    59.4±4.4    64.4±4.1    56.2±3.7      71.2±4.1    71.2±4.1    70.0±4.4    65.6±4.0
+custom n=4, 75%         62.5±6.2    73.8±5.0    73.8±5.9    78.8±5.2      87.5±5.9    96.2±3.8    97.5±2.5    91.2±4.9
+```
+
+What this shows:
+
+- **No meaningful harm.** Fitting rates are unchanged within noise. The parity‑4 column (7 / 13 / 3 / 7 of 40) bounces around; none of those differences are significant at 40 runs. Almost every generalization difference is within 1–2 standard errors.
+- **The one consistent signal is positive.** `custom` at 75% improves at every sparse density, with or without λ (best: 97.5% ± 2.5 vs 87.5% ± 5.9 at λ=0.1, density 0.15).
+- **This is expected at this scale.** With only 2–6 input signals per layer, "dense" and "sparse" neurons differ by just a literal or two. Density only bites at MONK's scale (17 inputs), where the default init starts each neuron with about 11 literals.
+
+Together with Step 18, this makes a sparse default safe, and a large improvement wherever inputs are wide. Changing the default would be a deliberate behavior change: it changes the golden fingerprint, and every number measured with the dense default would then describe the old default.
+
+---
+
+### Step 20 — Sparse initialization is now the default
+
+Based on Steps 18–19, `BooleanNetwork`, `train_with_restarts` and `train_ensemble` now default to `density=0.05` (`bool_net.DEFAULT_DENSITY`). Each neuron starts with roughly one literal and the search builds up from there. Among the densities tested, 0.05 was best on MONK‑1 and MONK‑2 and neutral on the toy benchmarks.
+
+**This is a deliberate behavior change.** Every number in Steps 1–19 was measured with the original dense init (density 2/3), and those numbers stay as they are, as a record of what was measured. To reproduce them:
+
+- `density=None` selects the original init with its exact random sequence. A test pins it to a fingerprint taken from the very first version of the code.
+- `test.py` sections 1–8 pass `density=None` explicitly, so rerunning them still reproduces the README's numbers. The 30‑run behavior fingerprint used throughout this README is unchanged under `density=None`.
+- The golden‑fingerprint test now pins both behaviors: dense (`density=None`) and the new sparse default.
+
+Expect results under the new default to look like Step 18's sparse rows, e.g. MONK‑1 ≈ 99% test vs 77% before. Expect training to sometimes take longer, because the search keeps making progress instead of stalling.
+
+---
+
 ## How This Compares to Standard (Real‑Valued) Backprop
 
 **Why real backprop is a single, cheap pass.** Differentiation is linear: the multivariate chain rule says a total derivative is a *sum* of path contributions. That linearity is what lets standard backprop cache one local Jacobian per layer during the forward pass, then compose them backward with a single matrix multiply per layer — never touching the raw data again. Cost stays proportional to network size, `O(depth × width²)`, same order as the forward pass.
@@ -726,6 +778,9 @@ train_data, test_data = make_dataset(n=2, target_fn=my_fn, observed_fraction=0.7
 net = BooleanNetwork(n_inputs=2, layer_widths=[4, 4], seed=42)
 train(net, train_data, max_steps=500, verbose=True)
 evaluate(net, train_data, test_data, verbose=True)
+
+# Networks start sparse by default (density=0.05, Step 20); pass density=None
+# for the original dense initialization.
 
 # With Boolean regularization (prefer simpler networks — see Step 13):
 net = train_with_restarts(n_inputs=2, layer_widths=[4, 4], train_data=train_data,

@@ -142,10 +142,15 @@ class TestInitialization(unittest.TestCase):
                                     f"seed={seed}: all-zero column")
 
     def test_density(self):
-        # None must reproduce the original init exactly (same RNG sequence).
+        # None must reproduce the original init exactly (same RNG sequence):
+        # fingerprint taken from the original code, commit dbf2545.
+        self.assertEqual(
+            weights_fingerprint(BooleanNetwork(5, [6, 3], seed=11, density=None)),
+            "efcbc6fb3ee77804")
+        # The default is sparse (Step 20).
         self.assertEqual(
             weights_fingerprint(BooleanNetwork(5, [6, 3], seed=11)),
-            weights_fingerprint(BooleanNetwork(5, [6, 3], seed=11, density=None)))
+            weights_fingerprint(BooleanNetwork(5, [6, 3], seed=11, density=0.05)))
         sizes = {}
         for d in (0.05, 0.3, 1.0):
             total = 0
@@ -265,21 +270,29 @@ class TestTraining(unittest.TestCase):
             self.assertFalse(net.has_contradiction(), f"seed={seed}")
 
     def test_unregularized_behavior_is_frozen(self):
-        """Golden fingerprints of lam=0 training. The README's convergence
-        numbers depend on this exact behavior; if a change is *meant* to
-        alter training, re-run test.py, update the README, then update
-        these values."""
+        """Golden fingerprints of lam=0 training. The README's numbers
+        depend on this exact behavior; if a change is *meant* to alter
+        training, re-run test.py, update the README, then update these.
+
+        Two are pinned: the original dense init (density=None), which every
+        README number up to Step 19 was measured with, and the current
+        default (sparse, density=0.05, since Step 20)."""
         data, _ = make_dataset(3, parity, observed_fraction=1.0, seed=0)
-        net = train_with_restarts(3, [6, 4], data, n_restarts=5,
-                                  verbose=False, seed=0)
+        dense = train_with_restarts(3, [6, 4], data, n_restarts=5,
+                                    verbose=False, seed=0, density=None)
         explicit = train_with_restarts(3, [6, 4], data, n_restarts=5,
-                                       verbose=False, seed=0, lam=0.0)
-        self.assertEqual(weights_fingerprint(net), weights_fingerprint(explicit))
-        self.assertEqual(weights_fingerprint(net), GOLDEN_PARITY3)
+                                       verbose=False, seed=0, lam=0.0, density=None)
+        self.assertEqual(weights_fingerprint(dense), weights_fingerprint(explicit))
+        self.assertEqual(weights_fingerprint(dense), GOLDEN_PARITY3_DENSE)
+        default = train_with_restarts(3, [6, 4], data, n_restarts=5,
+                                      verbose=False, seed=0)
+        self.assertEqual(weights_fingerprint(default), GOLDEN_PARITY3_DEFAULT)
 
 
-# Filled from the pre-regularization code (commit dbf2545) — see the test above.
-GOLDEN_PARITY3 = "ae9a144d52673805"
+# Dense init: from the pre-regularization code (commit dbf2545).
+GOLDEN_PARITY3_DENSE = "ae9a144d52673805"
+# Sparse default (density=0.05): recorded when it became the default (Step 20).
+GOLDEN_PARITY3_DEFAULT = "9dd58b20208fc8ed"
 
 
 class TestRegularization(unittest.TestCase):

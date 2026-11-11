@@ -110,6 +110,12 @@ def as_packed(data) -> PackedData:
 # Single layer
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Initial connection density (README Steps 18-20). Sparse starts made MONK-1
+# go from ~77% to ~99% test accuracy and were neutral on the toy benchmarks.
+# None selects the original dense init (2/3) with its exact RNG sequence.
+DEFAULT_DENSITY = 0.05
+
+
 class BooleanLayer:
     """
     A layer of independent AND‑neurons.
@@ -232,9 +238,11 @@ class BooleanNetwork:
     """
 
     def __init__(self, n_inputs: int, layer_widths: list, seed: int = 42,
-                 density: float = None):
+                 density: float = DEFAULT_DENSITY):
         """`density`: per-signal connection probability at init (see
-        BooleanLayer). None = original dense init (2/3)."""
+        BooleanLayer). Default 0.05 — sparse, so each neuron starts with
+        about one literal (README Steps 18-20). None = the original dense
+        init (density 2/3), kept for reproducing earlier results."""
         self.n_inputs = n_inputs
         self.layer_widths = layer_widths
         rng = random.Random(seed)
@@ -1166,7 +1174,7 @@ def train_with_restarts(
     seed: int = None,
     lam: float = 0.0,
     mu: float = 0.0,
-    density: float = None,
+    density: float = DEFAULT_DENSITY,
     **train_kwargs,
 ) -> BooleanNetwork:
     """
@@ -1251,6 +1259,7 @@ def train_ensemble(
     seed: int = None,
     lam: float = 0.0,
     mu: float = 0.0,
+    density: float = DEFAULT_DENSITY,
 ) -> Ensemble:
     """
     Train n_members networks independently (one train() run each — no
@@ -1261,7 +1270,8 @@ def train_ensemble(
     objective = Objective(train_data, lam, mu, n_inputs=n_inputs)
     trained = []
     for _ in range(n_members):
-        net = BooleanNetwork(n_inputs, layer_widths, seed=rng.randint(0, 2**31 - 1))
+        net = BooleanNetwork(n_inputs, layer_widths, seed=rng.randint(0, 2**31 - 1),
+                             density=density)
         train(net, train_data, max_steps=max_steps, verbose=False,
               seed=rng.randint(0, 2**31 - 1), lam=lam, mu=mu)
         trained.append((objective(net), net))
