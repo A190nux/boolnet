@@ -141,6 +141,29 @@ class TestInitialization(unittest.TestCase):
                     self.assertTrue(any(layer.W[i][j] for i in range(layer.input_width)),
                                     f"seed={seed}: all-zero column")
 
+    def test_density(self):
+        # None must reproduce the original init exactly (same RNG sequence).
+        self.assertEqual(
+            weights_fingerprint(BooleanNetwork(5, [6, 3], seed=11)),
+            weights_fingerprint(BooleanNetwork(5, [6, 3], seed=11, density=None)))
+        sizes = {}
+        for d in (0.05, 0.3, 1.0):
+            total = 0
+            for seed in range(30):
+                net = BooleanNetwork(10, [8, 4], seed=seed, density=d)
+                self.assertFalse(net.has_contradiction())
+                for layer in net.layers:
+                    m = layer.input_width // 2
+                    for j in range(layer.output_width):
+                        used = sum(layer.W[i][j] for i in range(layer.input_width))
+                        self.assertGreaterEqual(used, 1)          # never all-zero
+                        if d == 1.0:
+                            self.assertEqual(used, m)             # every signal used
+                total += net.complexity()
+            sizes[d] = total
+        self.assertLess(sizes[0.05], sizes[0.3])
+        self.assertLess(sizes[0.3], sizes[1.0])
+
     def test_same_seed_same_network(self):
         a = BooleanNetwork(4, [4, 4], seed=99)
         b = BooleanNetwork(4, [4, 4], seed=99)

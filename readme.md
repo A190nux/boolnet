@@ -606,6 +606,34 @@ What this shows:
 
 ---
 
+### Step 18 — Sparse initialization: where the search starts is what matters
+
+Step 17's hypothesis was that sparse networks are easier to search. `BooleanNetwork(..., density=d)` tests it from the other direction: start sparse instead of relying on λ to make the network sparse. `density` is the probability that a neuron uses each input signal (as `x` or `¬x`). The original init corresponds to 2/3 and is still the default (`density=None` keeps its exact random sequence, which a test pins). On MONK's `[8,4]`, the default starts with about 115 active weights; density 0.3 starts with 56, 0.15 with 33, and 0.05 with 20.
+
+**Results** (`test.py` section 8; 10 seeds; test accuracy mean ± standard error, with train accuracy in parentheses):
+
+```
+                         MONK-1                  MONK-2                  MONK-3 (noisy)
+decision tree            92.6        (100)       86.6        (100)       89.8        (100)
+λ=0, default init        76.9 ± 5.8  (79.8)      67.2 ± 0.4  (65.0)      80.3 ± 7.0  (80.3)
+λ=0, density 0.3         97.6 ± 1.3  (99.2)      71.8 ± 1.9  (80.0)      96.6 ± 0.3  (95.7)
+λ=0, density 0.15        97.1 ± 1.2  (98.5)      76.2 ± 1.2  (85.7)      95.9 ± 0.4  (96.3)
+λ=0, density 0.05        98.7 ± 1.0  (99.6)      79.9 ± 1.2  (87.3)      96.0 ± 0.6  (96.1)
+λ=1e-9, default init     88.8 ± 2.9  (92.7)      67.0 ± 0.8  (75.4)      96.6 ± 0.8  (94.7)
+λ=1e-9, density 0.05     99.0 ± 1.0  (99.6)      79.4 ± 2.1  (88.3)      95.7 ± 0.9  (97.0)
+```
+
+What this shows:
+
+- **Sparse initialization is the biggest single improvement so far.** MONK‑1 goes from 77% to about 99% test, clearly beating the decision tree (92.6%), so the network now usually recovers the exact concept. MONK‑2, which looked hopeless (stuck at the 67% of predicting the common label), climbs to about 80%. That beats nearest neighbour (72.2%) but is still behind the tree (86.6%). MONK‑3 holds its ~96%, now without needing λ.
+- **The hypothesis was close but not quite right.** With a sparse start, λ=0 ends with 40–90 active weights, yet it trains as well as λ=1e‑9, which ends with about 15. So what matters is *starting* sparse, not *staying* sparse. A plausible reason: a dense AND‑neuron is false on almost every row, so almost no single flip changes its output and backprop finds few useful candidates. A sparse neuron fires often, so the derivative signal is rich. This explanation is untested.
+- **λ is now mostly redundant for fitting.** Its training advantage at the default init (Steps 16–17) disappears once the start is sparse. It still makes the final network 3–4× smaller, which makes the learned formula much easier to read.
+- **Cost:** sparse MONK‑2 runs are 5–7× slower (150–220 s), because the search keeps making progress instead of giving up early.
+
+**Not yet checked:** whether a sparse start hurts the toy benchmarks. Parity in particular needs neurons with many literals, which a sparse start has to build up one flip at a time. That has to be measured before `density` gets a new default, which would also be a deliberate behavior change.
+
+---
+
 ## How This Compares to Standard (Real‑Valued) Backprop
 
 **Why real backprop is a single, cheap pass.** Differentiation is linear: the multivariate chain rule says a total derivative is a *sum* of path contributions. That linearity is what lets standard backprop cache one local Jacobian per layer during the forward pass, then compose them backward with a single matrix multiply per layer — never touching the raw data again. Cost stays proportional to network size, `O(depth × width²)`, same order as the forward pass.

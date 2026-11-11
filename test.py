@@ -1,5 +1,5 @@
 """
-test.py — Seven investigations, each producing numbers to fold back into the README:
+test.py — Eight investigations, each producing numbers to fold back into the README:
 
   1. Rerun XOR(n=2) and Parity(n=3) convergence stats with real, reproducible seeds
      (replaces old convergence claims with numbers from THIS run).
@@ -11,6 +11,7 @@ test.py — Seven investigations, each producing numbers to fold back into the R
   5. Compare regularizers: weight count, total influence, ensembles.
   6. A real dataset: MONK's problems vs decision tree / nearest-neighbour baselines.
   7. Neutral moves: isolating why λ > 0 helps the search.
+  8. Sparse initialization: are sparse networks easier to search?
 
 Fast correctness tests live in tests/ (python3 -m unittest discover -s tests).
 
@@ -379,6 +380,12 @@ MONKS_METHODS = {
     "λ=0 + neutral removals":  {"neutral": "remove"},
     "λ=0 + any neutral move":  {"neutral": "any"},
     "λ=0.1 + any neutral move": {"lam": 0.1, "neutral": "any"},
+    "λ=0, density 0.3":        {"density": 0.3},
+    "λ=0, density 0.15":       {"density": 0.15},
+    "λ=0, density 0.05":       {"density": 0.05},
+    "λ=1e-9, density 0.3":     {"lam": 1e-9, "density": 0.3},
+    "λ=1e-9, density 0.15":    {"lam": 1e-9, "density": 0.15},
+    "λ=1e-9, density 0.05":    {"lam": 1e-9, "density": 0.05},
 }
 
 
@@ -456,6 +463,32 @@ def run_neutral_section():
     print()
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 8. Sparse initialization: are sparse networks easier to search?
+# ─────────────────────────────────────────────────────────────────────────────
+
+def run_sparse_init_section():
+    """
+    Step 17's hypothesis: λ > 0 trains better mainly because it keeps the
+    network sparse throughout. If so, λ=0 started from a sparse network
+    should close much of the gap to λ=1e-9. The default init uses each
+    input signal with probability 2/3.
+    """
+    print("=" * 78)
+    print("8. SPARSE INIT: initial connection density (MONK's, [8,4])")
+    print("=" * 78)
+    for density in (None, 0.3, 0.15, 0.05):
+        sizes = [BooleanNetwork(17, [8, 4], seed=s, density=density).complexity()
+                 for s in range(50)]
+        print(f"  density {str(density or '2/3 (default)'):14s} → "
+              f"{sum(sizes)/len(sizes):5.1f} active weights at init")
+    monks_comparison([[8, 4]], ["λ=0", "λ=0, density 0.3", "λ=0, density 0.15",
+                                "λ=0, density 0.05", "λ=1e-9",
+                                "λ=1e-9, density 0.3", "λ=1e-9, density 0.15",
+                                "λ=1e-9, density 0.05"], range(10))
+    print()
+
+
 if __name__ == "__main__":
     run_convergence_section()
     run_complexity_section()
@@ -464,3 +497,4 @@ if __name__ == "__main__":
     run_regularizer_section()
     run_monks_section()
     run_neutral_section()
+    run_sparse_init_section()

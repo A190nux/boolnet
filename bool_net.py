@@ -119,7 +119,14 @@ class BooleanLayer:
         W[i][j] = 0  →  neuron j ignores input i
     """
 
-    def __init__(self, input_width: int, output_width: int, rng: random.Random):
+    def __init__(self, input_width: int, output_width: int, rng: random.Random,
+                 density: float = None):
+        """
+        `density` is the probability that a neuron uses each input signal
+        (as x or ¬x, equally likely). None keeps the original scheme — each
+        of the three non-contradictory patterns (unused, x, ¬x) with
+        probability 1/3, i.e. density 2/3 — and its exact RNG sequence.
+        """
         self.input_width = input_width
         self.output_width = output_width
         m = input_width // 2                     # number of original signals
@@ -131,7 +138,12 @@ class BooleanLayer:
                 # For each original signal i, randomly pick one of the three
                 # allowed non‑contradictory patterns: (0,0), (1,0), (0,1)
                 for i in range(m):
-                    choice = rng.randint(0, 2)
+                    if density is None:
+                        choice = rng.randint(0, 2)
+                    elif rng.random() < density:
+                        choice = rng.randint(1, 2)
+                    else:
+                        choice = 0
                     if choice == 0:
                         col[i] = 0
                         col[i + m] = 0
@@ -219,7 +231,10 @@ class BooleanNetwork:
     Multi‑layer Boolean neural network with backpropagation.
     """
 
-    def __init__(self, n_inputs: int, layer_widths: list, seed: int = 42):
+    def __init__(self, n_inputs: int, layer_widths: list, seed: int = 42,
+                 density: float = None):
+        """`density`: per-signal connection probability at init (see
+        BooleanLayer). None = original dense init (2/3)."""
         self.n_inputs = n_inputs
         self.layer_widths = layer_widths
         rng = random.Random(seed)
@@ -227,7 +242,7 @@ class BooleanNetwork:
         self.layers = []
         prev_width = 2 * n_inputs                # first input is augmented
         for L in layer_widths:
-            self.layers.append(BooleanLayer(prev_width, L, rng))
+            self.layers.append(BooleanLayer(prev_width, L, rng, density))
             prev_width = 2 * L                   # output augmented before next layer
 
         # Output gates: one weight per last‑layer neuron
@@ -1151,10 +1166,12 @@ def train_with_restarts(
     seed: int = None,
     lam: float = 0.0,
     mu: float = 0.0,
+    density: float = None,
     **train_kwargs,
 ) -> BooleanNetwork:
     """
     Extra keyword arguments (e.g. neutral="remove") are passed to train().
+    `density` sets the initial connection density (see BooleanLayer).
 
     `seed` controls both the per-restart network initialization AND the
     randomness inside each restart's train() call, so the entire multi-restart
@@ -1176,7 +1193,8 @@ def train_with_restarts(
             print(f"\n{'#'*64}")
             print(f"  RESTART {r}/{n_restarts}  (seed={net_seed})")
             print(f"{'#'*64}")
-        net = BooleanNetwork(n_inputs=n_inputs, layer_widths=layer_widths, seed=net_seed)
+        net = BooleanNetwork(n_inputs=n_inputs, layer_widths=layer_widths,
+                             seed=net_seed, density=density)
         train(net, train_data, max_steps=max_steps, verbose=verbose,
               seed=train_seed, lam=lam, mu=mu, **train_kwargs)
         loss = objective(net)
